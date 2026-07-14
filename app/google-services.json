@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1004716989793",
+    "project_id": "my-signage-app-d0b8a",
+    "storage_bucket": "my-signage-app-d0b8a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1004716989793:android:d4ff0f07bc0ebf2c3e3920",
+        "android_client_info": {
+          "package_name": "com.signage.player"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAFigPaOSZWM9Q0j3p6sT4DxslEy5dNBV8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

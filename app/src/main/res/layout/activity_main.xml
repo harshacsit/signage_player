@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+   xmlns:app="http://schemas.android.com/apk/res-auto"    
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0B0E14">
+
+    <LinearLayout
+        android:id="@+id/pairingLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:visibility="visible">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="WAITING TO BE PAIRED"
+            android:textColor="#7C88A6"
+            android:textSize="18sp"
+            android:letterSpacing="0.1"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:id="@+id/pairingCodeText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="------"
+            android:textColor="#4F7CFF"
+            android:textSize="72sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.2"
+            android:background="#131826"
+            android:paddingHorizontal="48dp"
+            android:paddingVertical="24dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Enter this code in the dashboard under Add Screen"
+            android:textColor="#7C88A6"
+            android:textSize="16sp" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/playerLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+
+        <androidx.media3.ui.PlayerView
+            android:id="@+id/videoView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone"
+            app:surface_type="texture_view"
+            app:use_controller="false" />
+
+        <ImageView
+            android:id="@+id/imageView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:visibility="gone" />
+    </FrameLayout>
+
+</FrameLayout>
