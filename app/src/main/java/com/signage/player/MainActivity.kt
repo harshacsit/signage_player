@@ -40,6 +40,10 @@ import kotlin.random.Random
 import android.view.Gravity
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.graphics.Color
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -69,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pairingCodeText: TextView
     private lateinit var videoView: PlayerView
     private lateinit var imageView: ImageView
+    private lateinit var webView: WebView
 
     private lateinit var cacheDataSourceFactory: CacheDataSource.Factory
     private var exoPlayer: ExoPlayer? = null
@@ -84,6 +89,10 @@ class MainActivity : AppCompatActivity() {
     // track which playlist we're already subscribed to, so a heartbeat-triggered
     // screen doc update doesn't tear down and rebuild the playlist listener every 30s.
     private var lastPlaylistId: String? = null
+
+    private var currentItemStartTime: Long = 0L
+    private var currentItemForLogging: Map<String, Any>? = null
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -111,6 +120,15 @@ class MainActivity : AppCompatActivity() {
         pairingCodeText = findViewById(R.id.pairingCodeText)
         videoView = findViewById(R.id.videoView)
         imageView = findViewById(R.id.imageView)
+        webView = findViewById(R.id.webView)
+        webView.setBackgroundColor(Color.BLACK)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.mediaPlaybackRequiresUserGesture = false // let YouTube/videos autoplay
+        webView.settings.loadWithOverviewMode = true
+        webView.settings.useWideViewPort = true
+        webView.webViewClient = WebViewClient()
+        webView.webChromeClient = WebChromeClient()
 
         screenId = getOrCreateScreenId()
         pairingCodeText.text = screenId
@@ -302,12 +320,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun playCurrentItem() {
-        Log.d("SignageDebug", "playCurrentItem called, items=${playlistItems.size}, index=$currentIndex")
+        Log.d(
+            "SignageDebug",
+            "playCurrentItem called, items=${playlistItems.size}, index=$currentIndex"
+        )
+        logPreviousItemPlayback()
 
         if (playlistItems.isEmpty()) return
         if (currentIndex >= playlistItems.size) currentIndex = 0
 
         val item = playlistItems[currentIndex]
+        currentItemStartTime = System.currentTimeMillis()
+        currentItemForLogging = item
+
         val url = item["url"] as? String ?: return
         val type = item["type"] as? String ?: "video"
         val duration = (item["durationSeconds"] as? Long ?: 8L) * 1000L
@@ -317,8 +342,9 @@ class MainActivity : AppCompatActivity() {
 
         if (type == "video") {
             imageView.visibility = View.GONE
+            webView.visibility = View.GONE
+            webView.loadUrl("about:blank") // stop any playing embed/page
             videoView.visibility = View.VISIBLE
-            applyItemRotation(videoView, itemRotation)
             videoView.resizeMode = when (resizeMode) {
                 "fill" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                 "stretch" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
@@ -334,11 +360,36 @@ class MainActivity : AppCompatActivity() {
                 advanceRunnable = runnable
                 handler.postDelayed(runnable, duration)
             }
-        } else {
+        } else if (type == "web") {
+        videoView.visibility = View.GONE
+        imageView.visibility = View.GONE
+        exoPlayer?.stop()
+        webView.visibility = View.VISIBLE
+
+        // Schedule the advance timer FIRST, before touching the WebView, so a
+        // load failure/exception can never prevent this item from rotating on time.
+        val runnable = Runnable { advance() }
+        advanceRunnable = runnable
+        handler.postDelayed(runnable, duration)
+
+        try {
+            val videoId = extractYoutubeVideoId(url)
+            Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
+            if (videoId != null) {
+                val isLive = url.contains("youtube.com/live/")
+                webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
+            } else {
+                webView.loadUrl(url)
+            }
+        } catch (e: Exception) {
+            Log.e("SignageDebug", "WebView load failed for $url", e)
+        }
+    } else {
             videoView.visibility = View.GONE
+            webView.visibility = View.GONE
+            webView.loadUrl("about:blank")
             imageView.visibility = View.VISIBLE
             exoPlayer?.stop()
-            applyItemRotation(imageView, itemRotation)
             imageView.scaleType = when (resizeMode) {
                 "fill" -> android.widget.ImageView.ScaleType.CENTER_CROP
                 "stretch" -> android.widget.ImageView.ScaleType.FIT_XY
@@ -375,7 +426,74 @@ class MainActivity : AppCompatActivity() {
             }
         }.start()
     }
+    /** Turns a pasted YouTube link (or bare video ID) into an autoplaying, muted embed URL. */
+    private fun toDisplayUrl(rawUrl: String): String {
+        val videoId = extractYoutubeVideoId(rawUrl)
+        return if (videoId != null) {
+            "https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=$videoId&rel=0&playsinline=1"
+        } else {
+            rawUrl // plain hosted webpage / .html — load as-is
+        }
+    }
+    private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
+        val loopParams = if (isLive) "" else "&loop=1&playlist=$videoId"
+        return """
+        <html><body style="margin:0;padding:0;background:#000;">
+        <iframe width="100%" height="100%" style="position:fixed;top:0;left:0;border:0;"
+          src="https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0$loopParams&rel=0&playsinline=1"
+          allow="autoplay; encrypted-media" allowfullscreen></iframe>
+        </body></html>
+    """.trimIndent()
+    }
+    private fun extractYoutubeVideoId(url: String): String? {
+        val pattern = Regex("(?:youtube\\.com/watch\\?v=|youtu\\.be/|youtube\\.com/embed/|youtube\\.com/live/|youtube\\.com/shorts/)([a-zA-Z0-9_-]{11})")
+        pattern.find(url)?.groupValues?.get(1)?.let { return it }
+        if (url.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) return url // bare video ID pasted directly
+        return null
+    }
+    /**
+     * Records how long the previous item actually played, so the dashboard can
+     * show per-ad playtime and daily totals. Called just before switching to a
+     * new item, and once more in onDestroy() so the last item still counts.
+     */
+    private fun logPreviousItemPlayback() {
+        val item = currentItemForLogging ?: return
+        if (currentItemStartTime == 0L) return
 
+        val playedMs = System.currentTimeMillis() - currentItemStartTime
+        currentItemStartTime = 0L
+        if (playedMs < 500) return // ignore instant/glitch skips
+
+        logPlaybackEvent(item, playedMs)
+    }
+
+    private fun logPlaybackEvent(item: Map<String, Any>, playedMs: Long) {
+        val url = item["url"] as? String ?: return
+        val type = item["type"] as? String ?: "video"
+        val playedSeconds = playedMs / 1000.0
+
+        val dateKey = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
+        val dayDocId = "${screenId}_$dateKey"
+        val itemDocId = java.net.URLEncoder.encode(url, "UTF-8").take(300)
+
+        db.collection("analytics").document(dayDocId)
+            .collection("items").document(itemDocId)
+            .set(
+                mapOf(
+                    "screenId" to screenId,
+                    "date" to dateKey,
+                    "url" to url,
+                    "type" to type,
+                    "playCount" to com.google.firebase.firestore.FieldValue.increment(1),
+                    "totalSeconds" to com.google.firebase.firestore.FieldValue.increment(playedSeconds),
+                    "lastPlayed" to Timestamp.now()
+                ),
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+            .addOnFailureListener { e ->
+                Log.e("SignageDebug", "Analytics log failed for $url", e)
+            }
+    }
     private fun advance() {
         if (playlistItems.isNotEmpty()) {
             currentIndex = (currentIndex + 1) % playlistItems.size
@@ -399,9 +517,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        logPreviousItemPlayback()
         screenListener?.remove()
         playlistListener?.remove()
         exoPlayer?.release()
+        webView.loadUrl("about:blank")
+        webView.destroy()
         advanceRunnable?.let { handler.removeCallbacks(it) }
     }
 }
