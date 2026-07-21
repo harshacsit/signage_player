@@ -1,1 +1,10 @@
 /build
+
+# Google Services file contains API keys and project IDs
+google-services.json
+google-services\ .json
+
+# Local signing files
+signing.properties
+release-keystore.jks
+debug.keystore
