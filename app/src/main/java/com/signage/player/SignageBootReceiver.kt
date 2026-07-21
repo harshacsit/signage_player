@@ -11,7 +11,6 @@ class SignageBootReceiver : BroadcastReceiver() {
         // Renamed tag to avoid collision with system 'bootreceiver' tracing
         val tag = "SignageBootReceiver"
         Log.d(tag, "onReceive: ${intent.action}")
-
         if (intent.action == Intent.ACTION_BOOT_COMPLETED || 
             intent.action == "android.intent.action.QUICKBOOT_POWERON") {
             

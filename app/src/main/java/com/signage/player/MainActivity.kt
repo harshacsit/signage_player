@@ -44,6 +44,10 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.WebChromeClient
 import android.graphics.Color
+import androidx.media3.common.util.Util
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -58,7 +62,7 @@ class MainActivity : AppCompatActivity() {
             simpleCache ?: synchronized(this) {
                 simpleCache ?: SimpleCache(
                     File(context.cacheDir, "media_cache"),
-                    LeastRecentlyUsedCacheEvictor(6L * 1024 * 1024 * 1024), // 2GB cap, oldest evicted first
+                    LeastRecentlyUsedCacheEvictor(6L * 1024 * 1024 * 1024), // 6GB cap
                     StandaloneDatabaseProvider(context)
                 ).also { simpleCache = it }
             }
@@ -76,6 +80,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
 
     private lateinit var cacheDataSourceFactory: CacheDataSource.Factory
+
+    private lateinit var liveDataSourceFactory: androidx.media3.datasource.DataSource.Factory
     private var exoPlayer: ExoPlayer? = null
     private var screenListener: ListenerRegistration? = null
     private var playlistListener: ListenerRegistration? = null
@@ -99,18 +105,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         enableImmersiveKiosk()
 
-        // ---- STEP 1: everything below must run BEFORE any Firestore call or
-        // any watchScreenDoc()/registerScreenIfNeeded()/startHeartbeat() call.
-        // Those functions touch screenId, pairingLayout, playerLayout, videoView,
-        // imageView, and exoPlayer — if Firebase auth is already cached from a
-        // previous launch, its check below is SYNCHRONOUS, so if those functions
-        // ran first, this would crash instantly every time the app reopens.
-
         prefs = getSharedPreferences("signage_prefs", Context.MODE_PRIVATE)
         db = FirebaseFirestore.getInstance()
 
-        // Must be set before ANY other Firestore call (get/set/update/listener) —
-        // Firestore throws if you try to change settings after first use.
         db.firestoreSettings = FirebaseFirestoreSettings.Builder()
             .setPersistenceEnabled(true)
             .build()
@@ -124,7 +121,7 @@ class MainActivity : AppCompatActivity() {
         webView.setBackgroundColor(Color.BLACK)
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false // let YouTube/videos autoplay
+        webView.settings.mediaPlaybackRequiresUserGesture = false 
         webView.settings.loadWithOverviewMode = true
         webView.settings.useWideViewPort = true
         webView.webViewClient = WebViewClient()
@@ -133,18 +130,26 @@ class MainActivity : AppCompatActivity() {
         screenId = getOrCreateScreenId()
         pairingCodeText.text = screenId
 
+        val userAgent = Util.getUserAgent(this, "SignagePlayer")
+
+        val okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .build()
+
+        val httpDataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
+            .setUserAgent(userAgent)
+
+        liveDataSourceFactory = httpDataSourceFactory
+
         // Wraps network requests in a disk cache: first play downloads + saves,
         // every play after that (including with no network at all) reads from disk.
         cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(getCache(this))
-            .setUpstreamDataSourceFactory(DefaultHttpDataSource.Factory())
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR) // don't crash playback if a cache write fails
+            .setUpstreamDataSourceFactory(httpDataSourceFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-        // attach the playback-state / error listener ONCE here, instead of
-        // re-adding a new listener every time playCurrentItem() runs. Previously
-        // every video start stacked another listener on top of the old ones,
-        // so advance() eventually fired multiple times per event -> rapid
-        // skipping through the playlist ("blinking").
         val renderersFactory = DefaultRenderersFactory(this)
 
         exoPlayer = ExoPlayer.Builder(this, renderersFactory)
@@ -155,21 +160,23 @@ class MainActivity : AppCompatActivity() {
                     override fun onPlaybackStateChanged(state: Int) {
                         if (state == Player.STATE_ENDED) advance()
                     }
-                    // Watchdog: if playback errors out, skip to the next item instead of freezing.
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        Log.e("SignagePlayer", "ExoPlayer error: ${error.errorCodeName} - ${error.message}", error)
+                        Log.e("SignagePlayer", "ExoPlayer error: ${error.errorCodeName} (${error.errorCode}) - ${error.message}", error)
+                        val cause = error.cause
+                        if (cause != null) {
+                            Log.e("SignagePlayer", "Caused by: ${cause.message}", cause)
+                        }
+                        
                         Toast.makeText(
                             this@MainActivity,
                             "Playback error: ${error.errorCodeName}",
                             Toast.LENGTH_LONG
                         ).show()
-                        handler.postDelayed({ advance() }, 3000) // wait 3s so you can read the toast before it skips
+                        handler.postDelayed({ advance() }, 3000)
                     }
                 })
             }
 
-        // ---- STEP 2: now it's safe to sign in and start talking to Firestore,
-        // since every variable/view these functions touch is already set up.
         val auth = FirebaseAuth.getInstance()
         if (auth.currentUser == null) {
             auth.signInAnonymously()
@@ -188,7 +195,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Keeps the display awake and fully hides system/nav bars for true kiosk fullscreen. */
     private fun enableImmersiveKiosk() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = (
@@ -219,9 +225,6 @@ class MainActivity : AppCompatActivity() {
         playerLayout.pivotY = params.height / 2f
         playerLayout.rotation = rotationDegrees.toFloat()
     }
-    /**
-     * Rotates just the current media view (video or image) inside playerLayout,
-     */
     private fun applyItemRotation(view: View, rotationDegrees: Int) {
         val playerParams = playerLayout.layoutParams as FrameLayout.LayoutParams
         val containerWidth = if (playerParams.width > 0) playerParams.width else resources.displayMetrics.widthPixels
@@ -243,10 +246,9 @@ class MainActivity : AppCompatActivity() {
     }
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enableImmersiveKiosk() // re-apply if a system dialog stole focus
+        if (hasFocus) enableImmersiveKiosk() 
     }
 
-    /** Persistent per-device pairing code, survives app restarts (not just reboots). */
     private fun getOrCreateScreenId(): String {
         prefs.getString("screen_id", null)?.let { return it }
         val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -343,19 +345,31 @@ class MainActivity : AppCompatActivity() {
         if (type == "video") {
             imageView.visibility = View.GONE
             webView.visibility = View.GONE
-            webView.loadUrl("about:blank") // stop any playing embed/page
+            webView.loadUrl("about:blank") 
             videoView.visibility = View.VISIBLE
             videoView.resizeMode = when (resizeMode) {
                 "fill" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                 "stretch" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
                 else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
             }
+            val isLive = item["isLive"] as? Boolean ?: false
+            val isHls = url.contains(".m3u8") || isLive
+
             exoPlayer?.let { player ->
-                player.setMediaItem(MediaItem.fromUri(url))
+                val mediaItem = MediaItem.fromUri(url)
+                val mediaSource = if (isHls) {
+                    androidx.media3.exoplayer.hls.HlsMediaSource.Factory(liveDataSourceFactory)
+                        .setAllowChunklessPreparation(true)
+                        .createMediaSource(mediaItem)
+                } else {
+                    DefaultMediaSourceFactory(this).setDataSourceFactory(cacheDataSourceFactory)
+                        .createMediaSource(mediaItem)
+                }
+                player.setMediaSource(mediaSource)
                 player.prepare()
                 player.play()
             }
-            if (item.containsKey("durationSeconds")) {
+            if (item.containsKey("durationSeconds") && !isLive) {
                 val runnable = Runnable { advance() }
                 advanceRunnable = runnable
                 handler.postDelayed(runnable, duration)
@@ -366,8 +380,6 @@ class MainActivity : AppCompatActivity() {
         exoPlayer?.stop()
         webView.visibility = View.VISIBLE
 
-        // Schedule the advance timer FIRST, before touching the WebView, so a
-        // load failure/exception can never prevent this item from rotating on time.
         val runnable = Runnable { advance() }
         advanceRunnable = runnable
         handler.postDelayed(runnable, duration)
@@ -401,15 +413,13 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed(runnable, duration)
         }
     }
-    /**
-     * Downloads every item in a newly-loaded playlist into the disk cache in the
-     * background, so a cold boot with no network can still play the playlist
-     * immediately instead of needing to have played it once online already.
-     */
     private fun prefetchPlaylistItems(items: List<Map<String, Any>>) {
         Thread {
             for (item in items) {
                 val url = item["url"] as? String ?: continue
+                val type = item["type"] as? String ?: "video"
+                if (type != "video") continue
+                
                 try {
                     val dataSpec = DataSpec(Uri.parse(url))
                     val cacheWriter = CacheWriter(
@@ -426,13 +436,12 @@ class MainActivity : AppCompatActivity() {
             }
         }.start()
     }
-    /** Turns a pasted YouTube link (or bare video ID) into an autoplaying, muted embed URL. */
     private fun toDisplayUrl(rawUrl: String): String {
         val videoId = extractYoutubeVideoId(rawUrl)
         return if (videoId != null) {
             "https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=$videoId&rel=0&playsinline=1"
         } else {
-            rawUrl // plain hosted webpage / .html — load as-is
+            rawUrl 
         }
     }
     private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
@@ -448,21 +457,16 @@ class MainActivity : AppCompatActivity() {
     private fun extractYoutubeVideoId(url: String): String? {
         val pattern = Regex("(?:youtube\\.com/watch\\?v=|youtu\\.be/|youtube\\.com/embed/|youtube\\.com/live/|youtube\\.com/shorts/)([a-zA-Z0-9_-]{11})")
         pattern.find(url)?.groupValues?.get(1)?.let { return it }
-        if (url.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) return url // bare video ID pasted directly
+        if (url.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) return url 
         return null
     }
-    /**
-     * Records how long the previous item actually played, so the dashboard can
-     * show per-ad playtime and daily totals. Called just before switching to a
-     * new item, and once more in onDestroy() so the last item still counts.
-     */
     private fun logPreviousItemPlayback() {
         val item = currentItemForLogging ?: return
         if (currentItemStartTime == 0L) return
 
         val playedMs = System.currentTimeMillis() - currentItemStartTime
         currentItemStartTime = 0L
-        if (playedMs < 500) return // ignore instant/glitch skips
+        if (playedMs < 500) return
 
         logPlaybackEvent(item, playedMs)
     }
