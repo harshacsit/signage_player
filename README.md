@@ -168,10 +168,23 @@ version check + silent install via Device Owner provisioning) is in progress
 - [ ] Offline duration alerts
 
 ## Project Structure
-## Project Structure
 
-The Android application follows a modular package structure to separate the core components responsible for media playback, device boot handling, and application lifecycle management. This organization improves code readability, simplifies maintenance, and allows each component to focus on a single responsibility.
-
+app/
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   │   └── com/
+│   │   │       └── signage/
+│   │   │           ├── player/
+│   │   │           ├── services/
+│   │   │           ├── receivers/
+│   │   │           ├── models/
+│   │   │           ├── utils/
+│   │   │           └── firebase/
+│   │   ├── res/
+│   │   └── AndroidManifest.xml
+│   └── test/
+└── build.gradle
 ### Directory Structure
 
 app/
@@ -184,7 +197,6 @@ app/
                         ├── MainActivity.kt
                         ├── SignageBootReceiver.kt
                         └── BootLaunchService.kt
-
  ## Team
 
 - Android / Firebase logic/dashboard — [Harsha Vardhan Eudu]
