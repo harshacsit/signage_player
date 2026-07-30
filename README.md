@@ -4,6 +4,11 @@ Android TV client for Bhimavaram Digitals's digital signage network — an
 Android application that pairs with a screen, receives a playlist assignment
 in real time, and plays ads (video, image, or web content) in a fullscreen
 kiosk loop across ~40 physical displays citywide.
+For full project documentation, please refer to:
+
+**Dashboard Repository:** https://github.com/harshacsit/digitals-signage.git
+
+**Technical Documentation:** `documents/Bhimavaram_Digitals_Technical_Documentation.docx`
 
 ## Overview
 
