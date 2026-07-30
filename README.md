@@ -168,7 +168,7 @@ version check + silent install via Device Owner provisioning) is in progress
 - [ ] Offline duration alerts
 
 ## Project Structure
-
+```text
 app/
 ├── src/
 │   ├── main/
@@ -185,8 +185,9 @@ app/
 │   │   └── AndroidManifest.xml
 │   └── test/
 └── build.gradle
+```
 ### Directory Structure
-
+```text
 app/
 └── src/
     └── main/
@@ -197,6 +198,7 @@ app/
                         ├── MainActivity.kt
                         ├── SignageBootReceiver.kt
                         └── BootLaunchService.kt
+```
  ## Team
 
 - Android / Firebase logic/dashboard — [Harsha Vardhan Eudu]
