@@ -66,6 +66,10 @@ class MainActivity : AppCompatActivity() {
                     StandaloneDatabaseProvider(context)
                 ).also { simpleCache = it }
             }
+
+        // Default bottom-zone height as a percentage, used when a screen doc
+        // has layoutMode == "split" but no explicit splitRatio field yet.
+        private const val DEFAULT_SPLIT_RATIO_PERCENT = 20
     }
 
     private lateinit var prefs: SharedPreferences
@@ -75,9 +79,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pairingLayout: LinearLayout
     private lateinit var playerLayout: FrameLayout
     private lateinit var pairingCodeText: TextView
+
+    // Top zone (full playlist: video / image / web / YouTube / HLS)
+    private lateinit var topZone: FrameLayout
     private lateinit var videoView: PlayerView
     private lateinit var imageView: ImageView
     private lateinit var webView: WebView
+
+    // Bottom zone (URL-based web strip, only present when layoutMode == "split")
+    private lateinit var bottomZone: FrameLayout
+    private lateinit var bottomWebView: WebView
+
+    // Tracks the URL currently loaded into bottomWebView so a heartbeat-triggered
+    // screen doc snapshot doesn't reload the page every ~5 minutes.
+    private var lastBottomWebUrl: String? = null
+    private var currentLayoutMode: String = "single"
 
     private lateinit var cacheDataSourceFactory: CacheDataSource.Factory
 
@@ -89,11 +105,14 @@ class MainActivity : AppCompatActivity() {
     private var playlistItems: List<Map<String, Any>> = emptyList()
     private var currentIndex = 0
     private val handler = Handler(Looper.getMainLooper())
-    private val heartbeatIntervalMs = 30_000L
+
+    // Corrected interval: at ~40 screens, a 30s heartbeat blows past the
+    // Firestore Spark free-tier write limit. 5 minutes keeps us well under it.
+    private val heartbeatIntervalMs = 300_000L
     private var advanceRunnable: Runnable? = null
 
     // track which playlist we're already subscribed to, so a heartbeat-triggered
-    // screen doc update doesn't tear down and rebuild the playlist listener every 30s.
+    // screen doc update doesn't tear down and rebuild the playlist listener every 5 min.
     private var lastPlaylistId: String? = null
 
     private var currentItemStartTime: Long = 0L
@@ -115,17 +134,37 @@ class MainActivity : AppCompatActivity() {
         pairingLayout = findViewById(R.id.pairingLayout)
         playerLayout = findViewById(R.id.playerLayout)
         pairingCodeText = findViewById(R.id.pairingCodeText)
+
+        topZone = findViewById(R.id.topZone)
         videoView = findViewById(R.id.videoView)
         imageView = findViewById(R.id.imageView)
         webView = findViewById(R.id.webView)
+
+        bottomZone = findViewById(R.id.bottomZone)
+        bottomWebView = findViewById(R.id.bottomWebView)
+
         webView.setBackgroundColor(Color.BLACK)
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false 
+        webView.settings.mediaPlaybackRequiresUserGesture = false
         webView.settings.loadWithOverviewMode = true
         webView.settings.useWideViewPort = true
         webView.webViewClient = WebViewClient()
         webView.webChromeClient = WebChromeClient()
+
+        // Same setup as the main webView above, for the bottom strip. Bottom
+        // zone visibility/height is driven entirely by explicit pixel values
+        // set in Kotlin (applySplitLayout), NOT by XML layout_weight — a
+        // weight-driven zero-height container makes WebView compositing fail
+        // on Realme hardware. Keep this the way it is.
+        bottomWebView.setBackgroundColor(Color.BLACK)
+        bottomWebView.settings.javaScriptEnabled = true
+        bottomWebView.settings.domStorageEnabled = true
+        bottomWebView.settings.mediaPlaybackRequiresUserGesture = false
+        bottomWebView.settings.loadWithOverviewMode = true
+        bottomWebView.settings.useWideViewPort = true
+        bottomWebView.webViewClient = WebViewClient()
+        bottomWebView.webChromeClient = WebChromeClient()
 
         screenId = getOrCreateScreenId()
         pairingCodeText.text = screenId
@@ -166,7 +205,7 @@ class MainActivity : AppCompatActivity() {
                         if (cause != null) {
                             Log.e("SignagePlayer", "Caused by: ${cause.message}", cause)
                         }
-                        
+
                         Toast.makeText(
                             this@MainActivity,
                             "Playback error: ${error.errorCodeName}",
@@ -206,6 +245,7 @@ class MainActivity : AppCompatActivity() {
                         or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 )
     }
+
     private fun applyScreenRotation(rotationDegrees: Int) {
         val displayMetrics = resources.displayMetrics
         val screenWidth = displayMetrics.widthPixels
@@ -224,7 +264,13 @@ class MainActivity : AppCompatActivity() {
         playerLayout.pivotX = params.width / 2f
         playerLayout.pivotY = params.height / 2f
         playerLayout.rotation = rotationDegrees.toFloat()
+
+        // Re-apply the split sizing every time rotation changes, since
+        // topZone/bottomZone pixel heights are derived from playerLayout's
+        // (post-rotation) height.
+        applySplitLayout(currentLayoutMode)
     }
+
     private fun applyItemRotation(view: View, rotationDegrees: Int) {
         val playerParams = playerLayout.layoutParams as FrameLayout.LayoutParams
         val containerWidth = if (playerParams.width > 0) playerParams.width else resources.displayMetrics.widthPixels
@@ -244,9 +290,61 @@ class MainActivity : AppCompatActivity() {
         view.pivotY = params.height / 2f
         view.rotation = rotationDegrees.toFloat()
     }
+
+    /**
+     * Sizes topZone/bottomZone with EXPLICIT pixel heights computed here in
+     * Kotlin. Do not switch this to XML layout_weight — a weight-driven
+     * zero-height container makes WebView compositing silently fail on
+     * Realme boxes (bottom strip renders blank/black even though the page
+     * loads fine). splitRatioPercent is "percent of the layout the BOTTOM
+     * zone occupies" — matches the dashboard's splitRatio field (10/20/30/40).
+     */
+    private fun applySplitLayout(layoutMode: String, splitRatioPercent: Int = DEFAULT_SPLIT_RATIO_PERCENT) {
+        currentLayoutMode = layoutMode
+
+        val playerParams = playerLayout.layoutParams as? FrameLayout.LayoutParams
+        val totalHeight = playerParams?.height?.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        val totalWidth = playerParams?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+
+        // topZone/bottomZone sit inside the vertical LinearLayout in
+        // activity_main.xml, so their layoutParams are LinearLayout.LayoutParams
+        // — NOT FrameLayout.LayoutParams. Casting to the wrong type here was
+        // throwing a ClassCastException on every launch once a screen was
+        // already paired (crash right on open). Do not change this back.
+        val topParams = topZone.layoutParams as LinearLayout.LayoutParams
+        val bottomParams = bottomZone.layoutParams as LinearLayout.LayoutParams
+
+        if (layoutMode == "split") {
+            val clampedPercent = splitRatioPercent.coerceIn(10, 40)
+            val bottomHeight = (totalHeight * clampedPercent) / 100
+            val topHeight = totalHeight - bottomHeight
+
+            topParams.width = totalWidth
+            topParams.height = topHeight
+            bottomParams.width = totalWidth
+            bottomParams.height = bottomHeight
+
+            bottomZone.visibility = View.VISIBLE
+        } else {
+            topParams.width = totalWidth
+            topParams.height = totalHeight
+            bottomParams.width = totalWidth
+            bottomParams.height = 0
+
+            bottomZone.visibility = View.GONE
+            if (lastBottomWebUrl != null) {
+                bottomWebView.loadUrl("about:blank")
+                lastBottomWebUrl = null
+            }
+        }
+
+        topZone.layoutParams = topParams
+        bottomZone.layoutParams = bottomParams
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enableImmersiveKiosk() 
+        if (hasFocus) enableImmersiveKiosk()
     }
 
     private fun getOrCreateScreenId(): String {
@@ -285,6 +383,22 @@ class MainActivity : AppCompatActivity() {
                         val rotation = (snapshot.getLong("rotation") ?: 0L).toInt()
                         applyScreenRotation(rotation)
 
+                        // ===== Bottom zone (split screen) =====
+                        val layoutMode = snapshot.getString("layoutMode") ?: "single"
+                        val bottomWebUrl = snapshot.getString("bottomWebUrl")
+                        val splitRatio = (snapshot.getLong("splitRatio") ?: DEFAULT_SPLIT_RATIO_PERCENT.toLong()).toInt()
+
+                        applySplitLayout(layoutMode, splitRatio)
+
+                        if (layoutMode == "split" && bottomWebUrl != null) {
+                            if (bottomWebUrl != lastBottomWebUrl) {
+                                lastBottomWebUrl = bottomWebUrl
+                                bottomWebView.loadUrl(bottomWebUrl)
+                            }
+                        } else if (lastBottomWebUrl != null) {
+                            bottomWebView.loadUrl("about:blank")
+                            lastBottomWebUrl = null
+                        }
 
                         val playlistId = snapshot.getString("currentPlaylist")
                         if (playlistId != null && playlistId != lastPlaylistId) {
@@ -345,7 +459,7 @@ class MainActivity : AppCompatActivity() {
         if (type == "video") {
             imageView.visibility = View.GONE
             webView.visibility = View.GONE
-            webView.loadUrl("about:blank") 
+            webView.loadUrl("about:blank")
             videoView.visibility = View.VISIBLE
             videoView.resizeMode = when (resizeMode) {
                 "fill" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
@@ -375,28 +489,28 @@ class MainActivity : AppCompatActivity() {
                 handler.postDelayed(runnable, duration)
             }
         } else if (type == "web") {
-        videoView.visibility = View.GONE
-        imageView.visibility = View.GONE
-        exoPlayer?.stop()
-        webView.visibility = View.VISIBLE
+            videoView.visibility = View.GONE
+            imageView.visibility = View.GONE
+            exoPlayer?.stop()
+            webView.visibility = View.VISIBLE
 
-        val runnable = Runnable { advance() }
-        advanceRunnable = runnable
-        handler.postDelayed(runnable, duration)
+            val runnable = Runnable { advance() }
+            advanceRunnable = runnable
+            handler.postDelayed(runnable, duration)
 
-        try {
-            val videoId = extractYoutubeVideoId(url)
-            Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
-            if (videoId != null) {
-                val isLive = url.contains("youtube.com/live/")
-                webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
-            } else {
-                webView.loadUrl(url)
+            try {
+                val videoId = extractYoutubeVideoId(url)
+                Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
+                if (videoId != null) {
+                    val isLive = url.contains("youtube.com/live/")
+                    webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
+                } else {
+                    webView.loadUrl(url)
+                }
+            } catch (e: Exception) {
+                Log.e("SignageDebug", "WebView load failed for $url", e)
             }
-        } catch (e: Exception) {
-            Log.e("SignageDebug", "WebView load failed for $url", e)
-        }
-    } else {
+        } else {
             videoView.visibility = View.GONE
             webView.visibility = View.GONE
             webView.loadUrl("about:blank")
@@ -413,13 +527,14 @@ class MainActivity : AppCompatActivity() {
             handler.postDelayed(runnable, duration)
         }
     }
+
     private fun prefetchPlaylistItems(items: List<Map<String, Any>>) {
         Thread {
             for (item in items) {
                 val url = item["url"] as? String ?: continue
                 val type = item["type"] as? String ?: "video"
                 if (type != "video") continue
-                
+
                 try {
                     val dataSpec = DataSpec(Uri.parse(url))
                     val cacheWriter = CacheWriter(
@@ -436,14 +551,16 @@ class MainActivity : AppCompatActivity() {
             }
         }.start()
     }
+
     private fun toDisplayUrl(rawUrl: String): String {
         val videoId = extractYoutubeVideoId(rawUrl)
         return if (videoId != null) {
             "https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=$videoId&rel=0&playsinline=1"
         } else {
-            rawUrl 
+            rawUrl
         }
     }
+
     private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
         val loopParams = if (isLive) "" else "&loop=1&playlist=$videoId"
         return """
@@ -454,12 +571,14 @@ class MainActivity : AppCompatActivity() {
         </body></html>
     """.trimIndent()
     }
+
     private fun extractYoutubeVideoId(url: String): String? {
         val pattern = Regex("(?:youtube\\.com/watch\\?v=|youtu\\.be/|youtube\\.com/embed/|youtube\\.com/live/|youtube\\.com/shorts/)([a-zA-Z0-9_-]{11})")
         pattern.find(url)?.groupValues?.get(1)?.let { return it }
-        if (url.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) return url 
+        if (url.matches(Regex("^[a-zA-Z0-9_-]{11}$"))) return url
         return null
     }
+
     private fun logPreviousItemPlayback() {
         val item = currentItemForLogging ?: return
         if (currentItemStartTime == 0L) return
@@ -498,6 +617,7 @@ class MainActivity : AppCompatActivity() {
                 Log.e("SignageDebug", "Analytics log failed for $url", e)
             }
     }
+
     private fun advance() {
         if (playlistItems.isNotEmpty()) {
             currentIndex = (currentIndex + 1) % playlistItems.size
@@ -527,6 +647,8 @@ class MainActivity : AppCompatActivity() {
         exoPlayer?.release()
         webView.loadUrl("about:blank")
         webView.destroy()
+        bottomWebView.loadUrl("about:blank")
+        bottomWebView.destroy()
         advanceRunnable?.let { handler.removeCallbacks(it) }
     }
 }

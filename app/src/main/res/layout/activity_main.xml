@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-   xmlns:app="http://schemas.android.com/apk/res-auto"    
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#0B0E14">
 
+    <!-- Pairing screen -->
     <LinearLayout
         android:id="@+id/pairingLayout"
         android:layout_width="match_parent"
@@ -42,33 +43,97 @@
             android:text="Enter this code in the dashboard under Add Screen"
             android:textColor="#7C88A6"
             android:textSize="16sp" />
+
     </LinearLayout>
 
+    <!-- Bottom branding — only visible on the pairing screen. playerLayout is
+         added after this in the FrameLayout stack, so it draws over this
+         block once a screen is paired and starts playing. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="20dp"
+        android:gravity="center"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Bhimavaram Digitals • An SRKREC Startup"
+            android:textColor="#7C88A6"
+            android:textSize="20sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="Harsha E"
+            android:textColor="#5A6480"
+            android:textSize="14sp" />
+
+    </LinearLayout>
+
+    <!-- Player layout: topZone + bottomZone. Both are plain FrameLayouts with
+         layout_height="0dp" as an XML placeholder only — the ACTUAL heights
+         are always set explicitly in pixels by MainActivity.applySplitLayout().
+         Do not add android:layout_weight here: a weight-driven zero-height
+         container makes WebView compositing silently fail on Realme boxes,
+         which is why this went the explicit-pixel-height route instead. -->
     <FrameLayout
         android:id="@+id/playerLayout"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone">
 
-        <androidx.media3.ui.PlayerView
-            android:id="@+id/videoView"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:visibility="gone"
-            app:surface_type="texture_view"
-            app:use_controller="false" />
+            android:orientation="vertical">
 
-        <ImageView
-            android:id="@+id/imageView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:scaleType="fitCenter"
-            android:visibility="gone" />
-        <WebView
-            android:id="@+id/webView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:visibility="gone" />
+            <FrameLayout
+                android:id="@+id/topZone"
+                android:layout_width="match_parent"
+                android:layout_height="0dp">
+
+                <androidx.media3.ui.PlayerView
+                    android:id="@+id/videoView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:visibility="gone"
+                    app:surface_type="texture_view"
+                    app:use_controller="false" />
+
+                <ImageView
+                    android:id="@+id/imageView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:scaleType="fitCenter"
+                    android:visibility="gone" />
+
+                <WebView
+                    android:id="@+id/webView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:visibility="gone" />
+
+            </FrameLayout>
+
+            <FrameLayout
+                android:id="@+id/bottomZone"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:visibility="gone"
+                android:background="#0B0E14">
+
+                <WebView
+                    android:id="@+id/bottomWebView"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent" />
+
+            </FrameLayout>
+
+        </LinearLayout>
 
     </FrameLayout>
 

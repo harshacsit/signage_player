@@ -45,6 +45,7 @@ class BootLaunchService : Service() {
 
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+
         }
         startActivity(launchIntent)
         Log.d(tag, "startActivity called from foreground service")
