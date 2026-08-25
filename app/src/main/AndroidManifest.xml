@@ -11,9 +11,9 @@
     <!-- Foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
     <!-- Optional -->
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Camera -->
@@ -23,13 +23,11 @@
         android:required="false" />
 
     <application
-        android:testOnly="true"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="B-link"
         android:theme="@style/Theme.AppCompat.NoActionBar"
         android:banner="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true"
         tools:ignore="MissingTvBanner">
 
         <!-- ================================================= -->
@@ -84,6 +82,12 @@
                 android:value="signage kiosk auto-launch after boot" />
 
         </service>
+
+        <service
+            android:name=".LiveViewService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+
         <receiver
             android:name=".SignageDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"

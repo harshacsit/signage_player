@@ -1,53 +1,59 @@
 package com.signage.player
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.util.Util
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.cache.CacheWriter
-import android.net.Uri
 import coil.load
 import com.google.firebase.Timestamp
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.ListenerRegistration
-import com.google.firebase.auth.FirebaseAuth
-import java.io.File
-import kotlin.random.Random
-import android.view.Gravity
-import androidx.annotation.OptIn
-import androidx.media3.common.util.UnstableApi
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.webkit.WebChromeClient
-import android.graphics.Color
-import androidx.media3.common.util.Util
-import androidx.media3.datasource.okhttp.OkHttpDataSource
 import okhttp3.OkHttpClient
+import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 @OptIn(UnstableApi::class)
 class MainActivity : AppCompatActivity() {
@@ -70,6 +76,7 @@ class MainActivity : AppCompatActivity() {
         // Default bottom-zone height as a percentage, used when a screen doc
         // has layoutMode == "split" but no explicit splitRatio field yet.
         private const val DEFAULT_SPLIT_RATIO_PERCENT = 20
+        private const val CAMERA_PERMISSION_REQUEST_CODE = 2001
     }
 
     private lateinit var prefs: SharedPreferences
@@ -200,15 +207,15 @@ class MainActivity : AppCompatActivity() {
                         if (state == Player.STATE_ENDED) advance()
                     }
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        Log.e("SignagePlayer", "ExoPlayer error: ${error.errorCodeName} (${error.errorCode}) - ${error.message}", error)
+                        Log.e("SignagePlayer", "ExoPlayer error: \${error.errorCodeName} (\${error.errorCode}) - \${error.message}", error)
                         val cause = error.cause
                         if (cause != null) {
-                            Log.e("SignagePlayer", "Caused by: ${cause.message}", cause)
+                            Log.e("SignagePlayer", "Caused by: \${cause.message}", cause)
                         }
 
                         Toast.makeText(
                             this@MainActivity,
-                            "Playback error: ${error.errorCodeName}",
+                            "Playback error: \${error.errorCodeName}",
                             Toast.LENGTH_LONG
                         ).show()
                         handler.postDelayed({ advance() }, 3000)
@@ -223,6 +230,7 @@ class MainActivity : AppCompatActivity() {
                     registerScreenIfNeeded()
                     watchScreenDoc()
                     startHeartbeat()
+                    startLiveView()
                 }
                 .addOnFailureListener { e ->
                     Log.e("SignagePlayer", "Anonymous sign-in failed", e)
@@ -231,6 +239,30 @@ class MainActivity : AppCompatActivity() {
             registerScreenIfNeeded()
             watchScreenDoc()
             startHeartbeat()
+            startLiveView()
+        }
+    }
+
+    private fun startLiveView() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST_CODE)
+            return
+        }
+        val intent = Intent(this, LiveViewService::class.java)
+            .putExtra(LiveViewService.EXTRA_SCREEN_ID, screenId)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == CAMERA_PERMISSION_REQUEST_CODE &&
+            grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startLiveView()
         }
     }
 
@@ -426,7 +458,7 @@ class MainActivity : AppCompatActivity() {
                     val items = snapshot.get("items") as? List<Map<String, Any>>
                     if (items != null) {
                         playlistItems = items
-                        Log.d("SignageDebug", "Loaded ${playlistItems.size} items for playlist $playlistId")
+                        Log.d("SignageDebug", "Loaded \${playlistItems.size} items for playlist \$playlistId")
                         currentIndex = 0
                         playCurrentItem()
                         prefetchPlaylistItems(items)
@@ -438,7 +470,7 @@ class MainActivity : AppCompatActivity() {
     private fun playCurrentItem() {
         Log.d(
             "SignageDebug",
-            "playCurrentItem called, items=${playlistItems.size}, index=$currentIndex"
+            "playCurrentItem called, items=\${playlistItems.size}, index=\$currentIndex"
         )
         logPreviousItemPlayback()
 
@@ -500,7 +532,7 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 val videoId = extractYoutubeVideoId(url)
-                Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
+                Log.d("SignageDebug", "web item url=\$url extracted videoId=\$videoId")
                 if (videoId != null) {
                     val isLive = url.contains("youtube.com/live/")
                     webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
@@ -508,7 +540,7 @@ class MainActivity : AppCompatActivity() {
                     webView.loadUrl(url)
                 }
             } catch (e: Exception) {
-                Log.e("SignageDebug", "WebView load failed for $url", e)
+                Log.e("SignageDebug", "WebView load failed for \$url", e)
             }
         } else {
             videoView.visibility = View.GONE
@@ -544,9 +576,9 @@ class MainActivity : AppCompatActivity() {
                         null
                     )
                     cacheWriter.cache()
-                    Log.d("SignageDebug", "Pre-cached: $url")
+                    Log.d("SignageDebug", "Pre-cached: \$url")
                 } catch (e: Exception) {
-                    Log.e("SignageDebug", "Pre-cache failed for $url", e)
+                    Log.e("SignageDebug", "Pre-cache failed for \$url", e)
                 }
             }
         }.start()
@@ -555,18 +587,18 @@ class MainActivity : AppCompatActivity() {
     private fun toDisplayUrl(rawUrl: String): String {
         val videoId = extractYoutubeVideoId(rawUrl)
         return if (videoId != null) {
-            "https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=$videoId&rel=0&playsinline=1"
+            "https://www.youtube.com/embed/\$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=\$videoId&rel=0&playsinline=1"
         } else {
             rawUrl
         }
     }
 
     private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
-        val loopParams = if (isLive) "" else "&loop=1&playlist=$videoId"
+        val loopParams = if (isLive) "" else "&loop=1&playlist=\$videoId"
         return """
         <html><body style="margin:0;padding:0;background:#000;">
         <iframe width="100%" height="100%" style="position:fixed;top:0;left:0;border:0;"
-          src="https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0$loopParams&rel=0&playsinline=1"
+          src="https://www.youtube.com/embed/\$videoId?autoplay=1&mute=1&controls=0\$loopParams&rel=0&playsinline=1"
           allow="autoplay; encrypted-media" allowfullscreen></iframe>
         </body></html>
     """.trimIndent()
@@ -596,7 +628,7 @@ class MainActivity : AppCompatActivity() {
         val playedSeconds = playedMs / 1000.0
 
         val dateKey = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
-        val dayDocId = "${screenId}_$dateKey"
+        val dayDocId = "\${screenId}_\$dateKey"
         val itemDocId = java.net.URLEncoder.encode(url, "UTF-8").take(300)
 
         db.collection("analytics").document(dayDocId)
@@ -614,7 +646,7 @@ class MainActivity : AppCompatActivity() {
                 com.google.firebase.firestore.SetOptions.merge()
             )
             .addOnFailureListener { e ->
-                Log.e("SignageDebug", "Analytics log failed for $url", e)
+                Log.e("SignageDebug", "Analytics log failed for \$url", e)
             }
     }
 

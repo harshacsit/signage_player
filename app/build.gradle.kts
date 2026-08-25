@@ -4,6 +4,7 @@ plugins {
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.kotlinAndroid)
     alias(libs.plugins.googleServices)
+    alias(libs.plugins.kotlinSerialization)
 }
 
 android {
@@ -29,9 +30,10 @@ android {
         if (keystoreFile.exists()) {
             create("release") {
                 storeFile = keystoreFile
-                storePassword = "your_keystore_password" // Update this in your local environment
-                keyAlias = "your_key_alias"           // Update this in your local environment
-                keyPassword = "your_key_password"     // Update this in your local environment
+                // Use properties from local.properties or environment variables to avoid plaintext secrets
+                storePassword = project.findProperty("SIGNING_STORE_PASSWORD")?.toString() ?: ""
+                keyAlias = project.findProperty("SIGNING_KEY_ALIAS")?.toString() ?: ""
+                keyPassword = project.findProperty("SIGNING_KEY_PASSWORD")?.toString() ?: ""
             }
         }
     }
@@ -108,4 +110,15 @@ dependencies {
     implementation("androidx.media3:media3-database:1.3.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.3.1")
+
+    // WebRTC
+    implementation("org.webrtc:google-webrtc:1.0.32006")
+
+    // Supabase Realtime (signaling channel)
+    implementation("io.github.jan-tennert.supabase:realtime-kt:2.6.0")
+    implementation("io.ktor:ktor-client-okhttp:2.3.12")
+    implementation(libs.kotlinx.serialization.json)
+
+    // UVC USB webcam support
+    implementation("com.github.saki4510t:UVCCamera:master-SNAPSHOT")
 }
