@@ -7,152 +7,406 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.UVCCamera
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.realtime.Realtime
-import io.github.jan.supabase.realtime.channel
-import io.github.jan.supabase.realtime.broadcastFlow
 import io.github.jan.supabase.realtime.broadcast
+import io.github.jan.supabase.realtime.broadcastFlow
+import io.github.jan.supabase.realtime.channel
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import org.webrtc.*
-import android.util.Log
 
 class LiveViewService : Service() {
 
     companion object {
         private const val TAG = "LiveView"
+        private const val CAM_TAG = "CamStream"
+
         const val EXTRA_SCREEN_ID = "screen_id"
     }
 
-    // FIXED: was hardcoded in source (and the key's signature segment looked
-    // corrupted/repeating, not a real JWT signature). Now pulled from
-    // BuildConfig, which app/build.gradle.kts populates from local.properties
-    // / gradle -P properties / CI secrets — never committed to git.
-    // Add to your local.properties:
-    //   SUPABASE_URL=https://pltujqldjcjqnvfijlup.supabase.co
-    //   SUPABASE_ANON_KEY=<a real anon key from your Supabase project settings>
     private val supabaseUrl = BuildConfig.SUPABASE_URL
     private val supabaseAnonKey = BuildConfig.SUPABASE_ANON_KEY
 
     private lateinit var pairingId: String
-    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    private val serviceScope =
+        CoroutineScope(Dispatchers.Main + SupervisorJob())
+
     private lateinit var usbMonitor: USBMonitor
     private var uvcCamera: UVCCamera? = null
 
     private lateinit var eglBase: EglBase
     private lateinit var peerConnectionFactory: PeerConnectionFactory
+
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var customCapturer: UvcFrameVideoCapturer? = null
 
     private lateinit var surfaceHelper: SurfaceTextureHelper
-    private val connections = mutableMapOf<String, PeerConnection>()
+
+    private val connections =
+        mutableMapOf<String, PeerConnection>()
 
     private val supabase by lazy {
-        createSupabaseClient(supabaseUrl, supabaseAnonKey) { install(Realtime) }
+        createSupabaseClient(
+            supabaseUrl,
+            supabaseAnonKey
+        ) {
+            install(Realtime)
+        }
     }
-    private val channel by lazy { supabase.channel("signal-$pairingId") }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    private val channel by lazy {
+        supabase.channel("signal-$pairingId")
+    }
+
+    // ------------------------------------------------------------
+    // SERVICE START
+    // ------------------------------------------------------------
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
         Log.d(TAG, "LIVEVIEW: onStartCommand")
-        Log.d(TAG, "SUPABASE URL present = ${supabaseUrl.isNotBlank()}")
-        Log.d(TAG, "SUPABASE KEY present = ${supabaseAnonKey.isNotBlank()}")
 
-        // FIXED: Always call startForeground first. 
-        // ForegroundServiceDidNotStartInTimeException occurs if onStartCommand returns 
-        // or the service is stopped before startForeground() is called.
+        Log.d(
+            TAG,
+            "SUPABASE URL present = ${supabaseUrl.isNotBlank()}"
+        )
+
+        Log.d(
+            TAG,
+            "SUPABASE KEY present = ${supabaseAnonKey.isNotBlank()}"
+        )
+
         startForegroundWithNotification()
 
-        // FIXED: guard against missing config instead of crashing deep inside
-        // the Supabase client with a confusing error when local.properties
-        // hasn't been set up on a given build machine / device.
-        if (supabaseUrl.isBlank() || supabaseAnonKey.isBlank()) {
-            Log.e(TAG, "Supabase URL/key not configured (check local.properties) — LiveView disabled.")
+        if (
+            supabaseUrl.isBlank() ||
+            supabaseAnonKey.isBlank()
+        ) {
+            Log.e(
+                TAG,
+                "Supabase URL/key not configured"
+            )
+
             stopSelf()
+
             return START_NOT_STICKY
         }
 
-        pairingId = intent?.getStringExtra(EXTRA_SCREEN_ID) ?: "unknown-screen"
+        pairingId =
+            intent?.getStringExtra(EXTRA_SCREEN_ID)
+                ?: "unknown-screen"
+
+        Log.d(
+            TAG,
+            "PAIRING ID = $pairingId"
+        )
+
         initWebRtc()
-        Log.d(TAG, "LIVEVIEW: WebRTC initialized")
+
+        Log.d(
+            TAG,
+            "LIVEVIEW: WebRTC initialized"
+        )
 
         initUsbMonitor()
-        Log.d(TAG, "LIVEVIEW: USB monitor initialized")
-        serviceScope.launch { setupSignaling() }
+
+        Log.d(
+            TAG,
+            "LIVEVIEW: USB monitor initialized"
+        )
+
+        serviceScope.launch {
+            setupSignaling()
+        }
+
         return START_STICKY
     }
 
+    // ------------------------------------------------------------
+    // FOREGROUND SERVICE
+    // ------------------------------------------------------------
+
     private fun startForegroundWithNotification() {
+
         val channelId = "liveview_channel"
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // FIXED: was IMPORTANCE_MIN — some OEM skins (Realme/Kodak included)
-            // can suppress IMPORTANCE_MIN notifications entirely, which puts the
-            // foreground service at risk of being treated as improperly
-            // foregrounded and killed. LOW keeps it silent but reliable.
-            val nc = NotificationChannel(channelId, "Live Camera", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(nc)
+
+            val nc = NotificationChannel(
+                channelId,
+                "Live Camera",
+                NotificationManager.IMPORTANCE_LOW
+            )
+
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(nc)
         }
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Live View Active")
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(2, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+
+        val notification =
+            NotificationCompat.Builder(
+                this,
+                channelId
+            )
+                .setContentTitle("Live View Active")
+                .setSmallIcon(
+                    android.R.drawable.ic_menu_camera
+                )
+                .setPriority(
+                    NotificationCompat.PRIORITY_LOW
+                )
+                .build()
+
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+        ) {
+
+            startForeground(
+                2,
+                notification,
+                android.content.pm.ServiceInfo
+                    .FOREGROUND_SERVICE_TYPE_CAMERA
+            )
+
         } else {
-            startForeground(2, notification)
+
+            startForeground(
+                2,
+                notification
+            )
         }
     }
+
+    // ------------------------------------------------------------
+    // WEBRTC INITIALIZATION
+    // ------------------------------------------------------------
 
     private fun initWebRtc() {
-        eglBase = EglBase.create()
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(applicationContext).createInitializationOptions()
-        )
-        peerConnectionFactory = PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
-            .createPeerConnectionFactory()
 
-        customCapturer = UvcFrameVideoCapturer()
-        surfaceHelper = SurfaceTextureHelper.create("LiveViewCapture", eglBase.eglBaseContext)
-        videoSource = peerConnectionFactory.createVideoSource(false)
-        customCapturer!!.setupCapturer(surfaceHelper, applicationContext, videoSource!!.capturerObserver)
-        videoTrack = peerConnectionFactory.createVideoTrack("cam_track_$pairingId", videoSource)
+        Log.d(
+            CAM_TAG,
+            "========== WEBRTC INITIALIZATION =========="
+        )
+
+        eglBase = EglBase.create()
+
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory
+                .InitializationOptions
+                .builder(applicationContext)
+                .createInitializationOptions()
+        )
+
+        peerConnectionFactory =
+            PeerConnectionFactory.builder()
+
+                .setVideoEncoderFactory(
+                    DefaultVideoEncoderFactory(
+                        eglBase.eglBaseContext,
+                        true,
+                        true
+                    )
+                )
+
+                .setVideoDecoderFactory(
+                    DefaultVideoDecoderFactory(
+                        eglBase.eglBaseContext
+                    )
+                )
+
+                .createPeerConnectionFactory()
+
+        Log.d(
+            CAM_TAG,
+            "PEER CONNECTION FACTORY CREATED"
+        )
+
+        customCapturer =
+            UvcFrameVideoCapturer()
+
+        surfaceHelper =
+            SurfaceTextureHelper.create(
+                "LiveViewCapture",
+                eglBase.eglBaseContext
+            )
+
+        Log.d(
+            CAM_TAG,
+            "SURFACE TEXTURE HELPER CREATED"
+        )
+
+        videoSource =
+            peerConnectionFactory.createVideoSource(false)
+
+        Log.d(
+            CAM_TAG,
+            "VIDEO SOURCE CREATED"
+        )
+
+        customCapturer!!.setupCapturer(
+            surfaceHelper,
+            applicationContext,
+            videoSource!!.capturerObserver
+        )
+
+        Log.d(
+            CAM_TAG,
+            "CAPTURER OBSERVER CONNECTED"
+        )
+
+        videoTrack =
+            peerConnectionFactory.createVideoTrack(
+                "cam_track_$pairingId",
+                videoSource
+            )
+
+        Log.d(
+            CAM_TAG,
+            "VIDEO TRACK CREATED: " +
+                    "enabled=${videoTrack?.enabled()}, " +
+                    "id=${videoTrack?.id()}"
+        )
     }
+
+    // ------------------------------------------------------------
+    // USB MONITOR
+    // ------------------------------------------------------------
 
     private fun initUsbMonitor() {
-        Log.d(TAG, "LIVEVIEW: initUsbMonitor ENTERED")
 
-        usbMonitor = USBMonitor(this, object : USBMonitor.OnDeviceConnectListener {
-            override fun onAttach(device: UsbDevice) { usbMonitor.requestPermission(device) }
-            override fun onConnect(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock, createNew: Boolean) {
-                openCamera(ctrlBlock)
-            }
-            override fun onDisconnect(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock) {
-                uvcCamera?.stopPreview(); uvcCamera?.destroy(); uvcCamera = null
-            }
-            override fun onDettach(device: UsbDevice) {}
-            override fun onCancel(device: UsbDevice) {}
-        })
+        Log.d(
+            TAG,
+            "LIVEVIEW: initUsbMonitor ENTERED"
+        )
+
+        usbMonitor =
+            USBMonitor(
+                this,
+                object : USBMonitor.OnDeviceConnectListener {
+
+                    override fun onAttach(
+                        device: UsbDevice
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "USB DEVICE ATTACHED: ${device.deviceName}"
+                        )
+
+                        usbMonitor.requestPermission(
+                            device
+                        )
+                    }
+
+                    override fun onConnect(
+                        device: UsbDevice,
+                        ctrlBlock: USBMonitor.UsbControlBlock,
+                        createNew: Boolean
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "USB DEVICE CONNECTED: ${device.deviceName}"
+                        )
+
+                        openCamera(ctrlBlock)
+                    }
+
+                    override fun onDisconnect(
+                        device: UsbDevice,
+                        ctrlBlock: USBMonitor.UsbControlBlock
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "USB DEVICE DISCONNECTED"
+                        )
+
+                        uvcCamera?.stopPreview()
+                        uvcCamera?.destroy()
+                        uvcCamera = null
+                    }
+
+                    override fun onDettach(
+                        device: UsbDevice
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "USB DEVICE DETACHED"
+                        )
+                    }
+
+                    override fun onCancel(
+                        device: UsbDevice
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "USB PERMISSION CANCELLED"
+                        )
+                    }
+                }
+            )
+
         usbMonitor.register()
 
-        val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
-        usbManager.deviceList.values.forEach { usbMonitor.requestPermission(it) }
+        val usbManager =
+            getSystemService(
+                Context.USB_SERVICE
+            ) as UsbManager
+
+        usbManager.deviceList.values.forEach {
+
+            Log.d(
+                TAG,
+                "REQUESTING USB PERMISSION: ${it.deviceName}"
+            )
+
+            usbMonitor.requestPermission(it)
+        }
     }
 
-    private fun openCamera(ctrlBlock: USBMonitor.UsbControlBlock) {
-        if (uvcCamera != null) return
+    // ------------------------------------------------------------
+    // OPEN UVC CAMERA
+    // ------------------------------------------------------------
+
+    private fun openCamera(
+        ctrlBlock: USBMonitor.UsbControlBlock
+    ) {
+
+        if (uvcCamera != null) {
+
+            Log.d(
+                TAG,
+                "UVC CAMERA ALREADY OPEN"
+            )
+
+            return
+        }
 
         try {
+
             val camera = UVCCamera()
 
             camera.open(ctrlBlock)
 
-            Log.d(TAG, "UVC CAMERA OPENED")
+            Log.d(
+                TAG,
+                "UVC CAMERA OPENED"
+            )
 
             camera.setPreviewSize(
                 640,
@@ -160,28 +414,46 @@ class LiveViewService : Service() {
                 UVCCamera.FRAME_FORMAT_MJPEG
             )
 
-            Log.d(TAG, "UVC PREVIEW SIZE SET")
+            Log.d(
+                TAG,
+                "UVC PREVIEW SIZE SET: 640x480"
+            )
 
-            val texture = surfaceHelper.surfaceTexture
+            val texture =
+                surfaceHelper.surfaceTexture
 
-            Log.d(TAG, "UVC SURFACE TEXTURE = $texture")
+            Log.d(
+                TAG,
+                "UVC SURFACE TEXTURE = $texture"
+            )
 
             if (texture == null) {
-                Log.e(TAG, "UVC ERROR: SurfaceTexture is NULL")
+
+                Log.e(
+                    TAG,
+                    "UVC ERROR: SurfaceTexture IS NULL"
+                )
+
                 camera.close()
                 camera.destroy()
+
                 return
             }
 
             camera.setPreviewTexture(texture)
 
-            Log.d(TAG, "UVC PREVIEW TEXTURE SET")
+            Log.d(
+                TAG,
+                "UVC PREVIEW TEXTURE SET"
+            )
 
             camera.setFrameCallback(
                 { frameData ->
+
                     Log.d(
-                        TAG,
-                        "UVC FRAME RECEIVED: ${frameData.remaining()} bytes"
+                        CAM_TAG,
+                        "UVC FRAME RECEIVED: " +
+                                "${frameData.remaining()} bytes"
                     )
 
                     customCapturer?.pushFrame(
@@ -193,127 +465,768 @@ class LiveViewService : Service() {
                 UVCCamera.PIXEL_FORMAT_NV21
             )
 
-            Log.d(TAG, "UVC FRAME CALLBACK SET")
+            Log.d(
+                TAG,
+                "UVC FRAME CALLBACK SET"
+            )
 
             camera.startPreview()
 
-            Log.d(TAG, "UVC startPreview() CALLED")
+            Log.d(
+                TAG,
+                "UVC startPreview() CALLED"
+            )
 
             uvcCamera = camera
 
         } catch (e: Exception) {
-            Log.e(TAG, "UVC CAMERA ERROR", e)
+
+            Log.e(
+                TAG,
+                "UVC CAMERA ERROR",
+                e
+            )
         }
     }
+
+    // ------------------------------------------------------------
+    // SIGNALING
+    // ------------------------------------------------------------
+
     private suspend fun setupSignaling() {
+
+        Log.d(
+            TAG,
+            "SIGNALING: SUBSCRIBING"
+        )
+
         channel.subscribe()
 
+        Log.d(
+            TAG,
+            "SIGNALING: SUBSCRIBE CALLED"
+        )
+
+        // --------------------------------------------------------
+        // VIEWER READY
+        // --------------------------------------------------------
+
         serviceScope.launch {
-            channel.broadcastFlow<JsonObject>("viewer-ready").collect { payload ->
-                val viewerId = payload["viewerId"]?.jsonPrimitive?.content ?: return@collect
-                Log.d(TAG, "VIEWER-READY RECEIVED: $viewerId")
-                Log.d(TAG, "CREATING CONNECTION FOR VIEWER: $viewerId")
-                createConnectionForViewer(viewerId)
-            }
+
+            channel
+                .broadcastFlow<JsonObject>(
+                    "viewer-ready"
+                )
+                .collect { payload ->
+
+                    val viewerId =
+                        payload["viewerId"]
+                            ?.jsonPrimitive
+                            ?.content
+                            ?: return@collect
+
+                    Log.d(
+                        TAG,
+                        "VIEWER-READY RECEIVED: $viewerId"
+                    )
+
+                    if (connections.containsKey(viewerId)) {
+
+                        Log.d(
+                            TAG,
+                            "CONNECTION ALREADY EXISTS: $viewerId"
+                        )
+
+                        return@collect
+                    }
+
+                    Log.d(
+                        TAG,
+                        "CREATING CONNECTION FOR VIEWER: $viewerId"
+                    )
+
+                    createConnectionForViewer(
+                        viewerId
+                    )
+                }
         }
+
+        // --------------------------------------------------------
+        // ANSWER
+        // --------------------------------------------------------
+
         serviceScope.launch {
-            channel.broadcastFlow<JsonObject>("answer").collect { payload ->
-                val viewerId = payload["viewerId"]?.jsonPrimitive?.content ?: return@collect
-                val pc = connections[viewerId] ?: return@collect
-                val sdp = payload["answer"]?.jsonObject?.get("sdp")?.jsonPrimitive?.content ?: return@collect
-                pc.setRemoteDescription(SdpObserverAdapter(), SessionDescription(SessionDescription.Type.ANSWER, sdp))
-            }
+
+            channel
+                .broadcastFlow<JsonObject>(
+                    "answer"
+                )
+                .collect { payload ->
+
+                    Log.d(
+                        TAG,
+                        "ANSWER RECEIVED: $payload"
+                    )
+
+                    val viewerId =
+                        payload["viewerId"]
+                            ?.jsonPrimitive
+                            ?.content
+                            ?: return@collect
+
+                    val pc =
+                        connections[viewerId]
+
+                    if (pc == null) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "ANSWER RECEIVED BUT PC NOT FOUND: $viewerId"
+                        )
+
+                        return@collect
+                    }
+
+                    /*
+                     * Dashboard sends:
+                     *
+                     * {
+                     *   viewerId: "...",
+                     *   sdp: JSON.stringify(localDescription)
+                     * }
+                     *
+                     * Therefore Android must read payload["sdp"].
+                     */
+
+                    var sdpValue =
+                        payload["sdp"]
+                            ?.jsonPrimitive
+                            ?.content
+
+                    if (sdpValue == null) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "ANSWER SDP NOT FOUND"
+                        )
+
+                        Log.e(
+                            CAM_TAG,
+                            "ANSWER PAYLOAD = $payload"
+                        )
+
+                        return@collect
+                    }
+
+                    Log.d(
+                        CAM_TAG,
+                        "ANSWER SDP RECEIVED"
+                    )
+
+                    Log.d(
+                        CAM_TAG,
+                        "ANSWER SDP LENGTH = ${sdpValue.length}"
+                    )
+
+                    /*
+                     * Dashboard JSON.stringify() produces:
+                     *
+                     * {
+                     *   "type":"answer",
+                     *   "sdp":"..."
+                     * }
+                     */
+
+                    try {
+
+                        val answerJson =
+                            Json.parseToJsonElement(
+                                sdpValue
+                            ).jsonObject
+
+                        val actualSdp =
+                            answerJson["sdp"]
+                                ?.jsonPrimitive
+                                ?.content
+
+                        if (actualSdp.isNullOrBlank()) {
+
+                            Log.e(
+                                CAM_TAG,
+                                "PARSED ANSWER DOES NOT CONTAIN SDP"
+                            )
+
+                            return@collect
+                        }
+
+                        Log.d(
+                            CAM_TAG,
+                            "SETTING REMOTE DESCRIPTION"
+                        )
+
+                        pc.setRemoteDescription(
+                            object : SdpObserverAdapter() {
+
+                                override fun onSetSuccess() {
+
+                                    Log.d(
+                                        CAM_TAG,
+                                        "REMOTE DESCRIPTION SET SUCCESS"
+                                    )
+                                }
+
+                                override fun onSetFailure(
+                                    error: String?
+                                ) {
+
+                                    Log.e(
+                                        CAM_TAG,
+                                        "REMOTE DESCRIPTION SET FAILED: $error"
+                                    )
+                                }
+                            },
+                            SessionDescription(
+                                SessionDescription.Type.ANSWER,
+                                actualSdp
+                            )
+                        )
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "ANSWER PARSE ERROR",
+                            e
+                        )
+                    }
+                }
         }
+
+        // --------------------------------------------------------
+        // ICE CANDIDATE
+        // --------------------------------------------------------
+
         serviceScope.launch {
-            channel.broadcastFlow<JsonObject>("ice-candidate").collect { payload ->
-                if (payload["from"]?.jsonPrimitive?.content != "viewer") return@collect
-                val viewerId = payload["viewerId"]?.jsonPrimitive?.content ?: return@collect
-                val pc = connections[viewerId] ?: return@collect
-                val cand = payload["candidate"]?.jsonObject ?: return@collect
-                pc.addIceCandidate(IceCandidate(
-                    cand["sdpMid"]?.jsonPrimitive?.content ?: "",
-                    cand["sdpMLineIndex"]?.jsonPrimitive?.int ?: 0,
-                    cand["candidate"]?.jsonPrimitive?.content ?: ""
-                ))
-            }
+
+            channel
+                .broadcastFlow<JsonObject>(
+                    "ice-candidate"
+                )
+                .collect { payload ->
+
+                    if (
+                        payload["from"]
+                            ?.jsonPrimitive
+                            ?.content != "viewer"
+                    ) {
+                        return@collect
+                    }
+
+                    val viewerId =
+                        payload["viewerId"]
+                            ?.jsonPrimitive
+                            ?.content
+                            ?: return@collect
+
+                    val pc =
+                        connections[viewerId]
+                            ?: return@collect
+
+                    val cand =
+                        payload["candidate"]
+                            ?.jsonObject
+                            ?: return@collect
+
+                    val candidate =
+                        cand["candidate"]
+                            ?.jsonPrimitive
+                            ?.content
+
+                    val sdpMid =
+                        cand["sdpMid"]
+                            ?.jsonPrimitive
+                            ?.content
+                            ?: ""
+
+                    val sdpMLineIndex =
+                        cand["sdpMLineIndex"]
+                            ?.jsonPrimitive
+                            ?.int
+                            ?: 0
+
+                    if (candidate.isNullOrBlank()) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "EMPTY VIEWER ICE CANDIDATE"
+                        )
+
+                        return@collect
+                    }
+
+                    Log.d(
+                        CAM_TAG,
+                        "VIEWER ICE RECEIVED: $viewerId"
+                    )
+
+                    pc.addIceCandidate(
+                        IceCandidate(
+                            sdpMid,
+                            sdpMLineIndex,
+                            candidate
+                        )
+                    )
+                }
         }
     }
 
-    private fun createConnectionForViewer(viewerId: String) {
-        Log.d("CamStream", "CREATE CONNECTION START: $viewerId")
-        val rtcConfig = PeerConnection.RTCConfiguration(
-            listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+    // ------------------------------------------------------------
+    // CREATE PEER CONNECTION
+    // ------------------------------------------------------------
+
+    private fun createConnectionForViewer(
+        viewerId: String
+    ) {
+
+        Log.d(
+            CAM_TAG,
+            "========================================"
         )
-        val pc = peerConnectionFactory.createPeerConnection(rtcConfig, object : PeerConnectionObserverAdapter() {
-            override fun onIceCandidate(candidate: IceCandidate) {
-                serviceScope.launch {
-                    channel.broadcast("ice-candidate", buildJsonObject {
-                        put("viewerId", viewerId); put("from", "broadcaster")
-                        put("candidate", buildJsonObject {
-                            put("candidate", candidate.sdp)
-                            put("sdpMid", candidate.sdpMid)
-                            put("sdpMLineIndex", candidate.sdpMLineIndex)
-                        })
-                    })
-                }
-            }
-        }) ?: return
 
-        pc.addTrack(videoTrack)
-        Log.d("CamStream", "VIDEO TRACK ADDED")
-        connections[viewerId] = pc
-        serviceScope.launch {
-            while (connections[viewerId] === pc) {
-                delay(2000)
+        Log.d(
+            CAM_TAG,
+            "CREATE CONNECTION START: $viewerId"
+        )
 
-                pc.getStats { stats ->
-                    for (report in stats.statsMap.values) {
-                        if (report.type == "outbound-rtp") {
+        val track =
+            videoTrack
+
+        if (track == null) {
+
+            Log.e(
+                CAM_TAG,
+                "VIDEO TRACK IS NULL - CANNOT CREATE CONNECTION"
+            )
+
+            return
+        }
+
+        Log.d(
+            CAM_TAG,
+            "VIDEO TRACK BEFORE ADD: " +
+                    "enabled=${track.enabled()}, " +
+                    "id=${track.id()}"
+        )
+
+        val rtcConfig =
+            PeerConnection.RTCConfiguration(
+                listOf(
+                    PeerConnection.IceServer
+                        .builder(
+                            "stun:stun.l.google.com:19302"
+                        )
+                        .createIceServer()
+                )
+            )
+
+        val pc =
+            peerConnectionFactory
+                .createPeerConnection(
+                    rtcConfig,
+                    object :
+                        PeerConnectionObserverAdapter() {
+
+                        override fun onIceCandidate(
+                            candidate: IceCandidate
+                        ) {
+
                             Log.d(
-                                "CamStream",
-                                "ANDROID OUTBOUND RTP: " +
-                                        "kind=${report.members["kind"]} " +
-                                        "mediaType=${report.members["mediaType"]} " +
-                                        "packetsSent=${report.members["packetsSent"]} " +
-                                        "bytesSent=${report.members["bytesSent"]} " +
-                                        "framesEncoded=${report.members["framesEncoded"]}"
+                                CAM_TAG,
+                                "ANDROID ICE CANDIDATE CREATED"
+                            )
+
+                            serviceScope.launch {
+
+                                channel.broadcast(
+                                    "ice-candidate",
+                                    buildJsonObject {
+
+                                        put(
+                                            "viewerId",
+                                            viewerId
+                                        )
+
+                                        put(
+                                            "from",
+                                            "broadcaster"
+                                        )
+
+                                        put(
+                                            "candidate",
+                                            buildJsonObject {
+
+                                                put(
+                                                    "candidate",
+                                                    candidate.sdp
+                                                )
+
+                                                put(
+                                                    "sdpMid",
+                                                    candidate.sdpMid
+                                                )
+
+                                                put(
+                                                    "sdpMLineIndex",
+                                                    candidate.sdpMLineIndex
+                                                )
+                                            }
+                                        )
+                                    }
+                                )
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID ICE CANDIDATE SENT: $viewerId"
+                                )
+                            }
+                        }
+
+                        override fun onIceConnectionChange(
+                            state: PeerConnection.IceConnectionState?
+                        ) {
+
+                            Log.d(
+                                CAM_TAG,
+                                "ANDROID ICE STATE: $state"
+                            )
+                        }
+
+                        override fun onConnectionChange(
+                            newState: PeerConnection.PeerConnectionState?
+                        ) {
+
+                            Log.d(
+                                CAM_TAG,
+                                "ANDROID CONNECTION STATE: $newState"
+                            )
+                        }
+
+                        override fun onSignalingChange(
+                            state: PeerConnection.SignalingState?
+                        ) {
+
+                            Log.d(
+                                CAM_TAG,
+                                "ANDROID SIGNALING STATE: $state"
+                            )
+                        }
+
+                        override fun onIceGatheringChange(
+                            state: PeerConnection.IceGatheringState?
+                        ) {
+
+                            Log.d(
+                                CAM_TAG,
+                                "ANDROID ICE GATHERING: $state"
                             )
                         }
                     }
+                )
+
+        if (pc == null) {
+
+            Log.e(
+                CAM_TAG,
+                "PEER CONNECTION CREATION FAILED"
+            )
+
+            return
+        }
+
+        Log.d(
+            CAM_TAG,
+            "PEER CONNECTION CREATED"
+        )
+
+        // --------------------------------------------------------
+        // ADD VIDEO TRACK
+        // --------------------------------------------------------
+
+        val sender =
+            pc.addTrack(track)
+
+        Log.d(
+            CAM_TAG,
+            "VIDEO TRACK ADDED: " +
+                    "enabled=${track.enabled()}, " +
+                    "id=${track.id()}"
+        )
+
+        Log.d(
+            CAM_TAG,
+            "RTP SENDER CREATED: $sender"
+        )
+
+        connections[viewerId] = pc
+
+        // --------------------------------------------------------
+        // RTP STATS
+        // --------------------------------------------------------
+
+        serviceScope.launch {
+
+            while (
+                connections[viewerId] === pc
+            ) {
+
+                delay(2000)
+
+                try {
+
+                    pc.getStats { stats ->
+
+                        var foundOutbound =
+                            false
+
+                        for (
+                        report
+                        in stats.statsMap.values
+                        ) {
+
+                            if (
+                                report.type ==
+                                "outbound-rtp"
+                            ) {
+
+                                foundOutbound = true
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID OUTBOUND RTP: " +
+                                            "kind=${report.members["kind"]} " +
+                                            "mediaType=${report.members["mediaType"]} " +
+                                            "packetsSent=${report.members["packetsSent"]} " +
+                                            "bytesSent=${report.members["bytesSent"]} " +
+                                            "framesEncoded=${report.members["framesEncoded"]} " +
+                                            "framesSent=${report.members["framesSent"]}"
+                                )
+                            }
+
+                            if (
+                                report.type ==
+                                "media-source"
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID MEDIA SOURCE: " +
+                                            "kind=${report.members["kind"]} " +
+                                            "width=${report.members["width"]} " +
+                                            "height=${report.members["height"]} " +
+                                            "frames=${report.members["frames"]}"
+                                )
+                            }
+                        }
+
+                        if (!foundOutbound) {
+
+                            Log.d(
+                                CAM_TAG,
+                                "NO OUTBOUND RTP REPORT FOUND"
+                            )
+                        }
+                    }
+
+                } catch (e: Exception) {
+
+                    Log.e(
+                        CAM_TAG,
+                        "ANDROID STATS ERROR",
+                        e
+                    )
                 }
             }
         }
-        pc.createOffer(object : SdpObserverAdapter() {
-            override fun onCreateSuccess(desc: SessionDescription?) {
-                if (desc == null) return
 
-                Log.d("CamStream", "OFFER CREATED")
+        // --------------------------------------------------------
+        // CREATE OFFER
+        // --------------------------------------------------------
 
-                pc.setLocalDescription(SdpObserverAdapter(), desc)
+        pc.createOffer(
+            object : SdpObserverAdapter() {
 
-                serviceScope.launch {
-                    Log.d("CamStream", "SENDING OFFER: $viewerId")
+                override fun onCreateSuccess(
+                    desc: SessionDescription?
+                ) {
 
-                    channel.broadcast("offer", buildJsonObject {
-                        put("viewerId", viewerId)
-                        put("offer", buildJsonObject {
-                            put("type", "offer")
-                            put("sdp", desc.description)
-                        })
-                    })
+                    if (desc == null) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "OFFER CREATED BUT DESC IS NULL"
+                        )
+
+                        return
+                    }
+
+                    Log.d(
+                        CAM_TAG,
+                        "OFFER CREATED"
+                    )
+
+                    Log.d(
+                        CAM_TAG,
+                        "OFFER SDP LENGTH = ${desc.description.length}"
+                    )
+
+                    pc.setLocalDescription(
+                        object : SdpObserverAdapter() {
+
+                            override fun onSetSuccess() {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "LOCAL DESCRIPTION SET SUCCESS"
+                                )
+                            }
+
+                            override fun onSetFailure(
+                                error: String?
+                            ) {
+
+                                Log.e(
+                                    CAM_TAG,
+                                    "LOCAL DESCRIPTION SET FAILED: $error"
+                                )
+                            }
+                        },
+                        desc
+                    )
+
+                    serviceScope.launch {
+
+                        Log.d(
+                            CAM_TAG,
+                            "SENDING OFFER: $viewerId"
+                        )
+
+                        channel.broadcast(
+                            "offer",
+                            buildJsonObject {
+
+                                put(
+                                    "viewerId",
+                                    viewerId
+                                )
+
+                                put(
+                                    "offer",
+                                    buildJsonObject {
+
+                                        put(
+                                            "type",
+                                            "offer"
+                                        )
+
+                                        put(
+                                            "sdp",
+                                            desc.description
+                                        )
+                                    }
+                                )
+                            }
+                        )
+
+                        Log.d(
+                            CAM_TAG,
+                            "OFFER SENT: $viewerId"
+                        )
+                    }
                 }
-            }
-        }, MediaConstraints())
+
+                override fun onCreateFailure(
+                    error: String?
+                ) {
+
+                    Log.e(
+                        CAM_TAG,
+                        "OFFER CREATE FAILED: $error"
+                    )
+                }
+            },
+            MediaConstraints()
+        )
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    // ------------------------------------------------------------
+    // SERVICE BINDING
+    // ------------------------------------------------------------
+
+    override fun onBind(
+        intent: Intent?
+    ): IBinder? = null
+
+    // ------------------------------------------------------------
+    // DESTROY
+    // ------------------------------------------------------------
+
     override fun onDestroy() {
-        connections.values.forEach { it.close() }
-        uvcCamera?.destroy()
-        if (::usbMonitor.isInitialized) {
-            usbMonitor.unregister()
+
+        Log.d(
+            TAG,
+            "LIVEVIEW SERVICE DESTROYING"
+        )
+
+        connections.values.forEach {
+
+            try {
+                it.close()
+            } catch (_: Exception) {
+            }
         }
+
+        connections.clear()
+
+        try {
+            uvcCamera?.stopPreview()
+        } catch (_: Exception) {
+        }
+
+        try {
+            uvcCamera?.destroy()
+        } catch (_: Exception) {
+        }
+
+        uvcCamera = null
+
+        if (::usbMonitor.isInitialized) {
+
+            try {
+                usbMonitor.unregister()
+            } catch (_: Exception) {
+            }
+        }
+
+        if (::surfaceHelper.isInitialized) {
+
+            try {
+                surfaceHelper.dispose()
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            peerConnectionFactory.dispose()
+        } catch (_: Exception) {
+        }
+
+        try {
+            eglBase.release()
+        } catch (_: Exception) {
+        }
+
         serviceScope.cancel()
+
         super.onDestroy()
     }
 }

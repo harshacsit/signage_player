@@ -44,41 +44,165 @@ open class PeerConnectionObserverAdapter : PeerConnection.Observer {
  * left as-is rather than guessing at behavior I can't verify without a device.
  */
 class UvcFrameVideoCapturer : VideoCapturer {
+
     private var capturerObserver: CapturerObserver? = null
     private var surfaceHelper: SurfaceTextureHelper? = null
+    private var started = false
 
-    fun setupCapturer(helper: SurfaceTextureHelper, context: android.content.Context, observer: CapturerObserver) {
-        this.surfaceHelper = helper
-        this.capturerObserver = observer
+    fun setupCapturer(
+        helper: SurfaceTextureHelper,
+        context: android.content.Context,
+        observer: CapturerObserver
+    ) {
+        surfaceHelper = helper
+        capturerObserver = observer
+
+        Log.d("CamStream", "CAPTURER OBSERVER SET")
+
+        if (!started) {
+            observer.onCapturerStarted(true)
+            started = true
+
+            Log.d(
+                "CamStream",
+                "CAPTURER STARTED SUCCESSFULLY"
+            )
+        }
     }
 
-    /** Call this from the UVCCamera frame callback with each new frame. */
-    fun pushFrame(frameBuffer: ByteBuffer, width: Int, height: Int) {
+    fun pushFrame(
+        frameBuffer: ByteBuffer,
+        width: Int,
+        height: Int
+    ) {
+        val observer = capturerObserver
+
+        if (observer == null) {
+            Log.e("CamStream", "CAPTURER OBSERVER IS NULL")
+            return
+        }
+
+        if (!started) {
+            Log.e("CamStream", "CAPTURER NOT STARTED")
+            return
+        }
+
         val nv21Data = ByteArray(frameBuffer.remaining())
         frameBuffer.get(nv21Data)
 
-        // Use NV21Buffer to wrap the raw data for WebRTC consumption.
-        // If NV21Buffer is missing in your WebRTC version, you may need a manual implementation.
-        val buffer = NV21Buffer(nv21Data, width, height, null)
-        val frame = VideoFrame(buffer, 0, System.nanoTime())
-        if (capturerObserver != null) {
-            Log.d("CamStream", "WEBRTC FRAME PUSHING: ${width}x${height}")
-            capturerObserver!!.onFrameCaptured(frame)
-        } else {
-            Log.e("CamStream", "WEBRTC ERROR: capturerObserver is NULL")
+        Log.d(
+            "CamStream",
+            "WEBRTC FRAME PUSHING: ${width}x${height}, bytes=${nv21Data.size}"
+        )
+
+        val buffer = NV21Buffer(
+            nv21Data,
+            width,
+            height,
+            null
+        )
+
+        val frame = VideoFrame(
+            buffer,
+            0,
+            System.nanoTime()
+        )
+
+        try {
+            Log.d(
+                "CamStream",
+                "SENDING FRAME TO WEBRTC"
+            )
+
+            observer.onFrameCaptured(frame)
+
+            Log.d(
+                "CamStream",
+                "FRAME SENT TO WEBRTC"
+            )
+        } catch (e: Exception) {
+            Log.e(
+                "CamStream",
+                "FRAME DELIVERY FAILED",
+                e
+            )
+        } finally {
+            frame.release()
+        }
+    }
+
+    override fun initialize(
+        surfaceTextureHelper: SurfaceTextureHelper?,
+        applicationContext: android.content.Context?,
+        capturerObserver: CapturerObserver?
+    ) {
+        this.surfaceHelper = surfaceTextureHelper
+        this.capturerObserver = capturerObserver
+
+        Log.d(
+            "CamStream",
+            "CAPTURER INITIALIZED"
+        )
+    }
+
+    override fun startCapture(
+        width: Int,
+        height: Int,
+        framerate: Int
+    ) {
+        Log.d(
+            "CamStream",
+            "startCapture: ${width}x${height} @ ${framerate}fps"
+        )
+
+        if (!started) {
+            capturerObserver?.onCapturerStarted(true)
+            started = true
+
+            Log.d(
+                "CamStream",
+                "CAPTURER STARTED FROM startCapture"
+            )
+        }
+    }
+
+    override fun stopCapture() {
+        Log.d(
+            "CamStream",
+            "stopCapture"
+        )
+
+        if (started) {
+            capturerObserver?.onCapturerStopped()
+            started = false
+        }
+    }
+
+    override fun changeCaptureFormat(
+        width: Int,
+        height: Int,
+        framerate: Int
+    ) {
+        Log.d(
+            "CamStream",
+            "changeCaptureFormat: ${width}x${height} @ ${framerate}fps"
+        )
+    }
+
+    override fun dispose() {
+        Log.d(
+            "CamStream",
+            "CAPTURER DISPOSE"
+        )
+
+        if (started) {
+            capturerObserver?.onCapturerStopped()
+            started = false
         }
 
-        frame.release()
+        capturerObserver = null
+        surfaceHelper = null
     }
 
-    override fun initialize(surfaceTextureHelper: SurfaceTextureHelper?, applicationContext: android.content.Context?, capturerObserver: CapturerObserver?) {
-        this.capturerObserver = capturerObserver
-        this.surfaceHelper = surfaceTextureHelper
-    }
-
-    override fun startCapture(width: Int, height: Int, framerate: Int) {}
-    override fun stopCapture() {}
-    override fun changeCaptureFormat(width: Int, height: Int, framerate: Int) {}
-    override fun dispose() {}
     override fun isScreencast(): Boolean = false
 }
