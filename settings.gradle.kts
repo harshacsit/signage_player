@@ -1,14 +1,19 @@
 pluginManagement {
     repositories {
-        google {
-            content {
-                includeGroupByRegex("com\\.android.*")
-                includeGroupByRegex("com\\.google.*")
-                includeGroupByRegex("androidx.*")
-            }
-        }
+        google()
         mavenCentral()
-        gradlePluginPortal()
+
+        maven {
+            url = uri("https://repository.liferay.com/nexus/content/repositories/public/")
+        }
+
+        maven { url = uri("https://storage.googleapis.com/chromium-webrtc-archive/maven/full") }
+        maven("https://raw.githubusercontent.com/saki4510t/UVCCommon/master/repository/")
+        maven {
+            url = uri("http://raw.github.com/saki4510t/libcommon/master/repository/")
+            isAllowInsecureProtocol = true
+        }
+        maven("https://jitpack.io")
     }
 }
 plugins {
@@ -19,6 +24,12 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven { url = uri("https://storage.googleapis.com/chromium-webrtc-archive/maven/full") }
+        maven("https://raw.githubusercontent.com/saki4510t/UVCCommon/master/repository/")
+        maven {
+            url = uri("http://raw.github.com/saki4510t/libcommon/master/repository/")
+            isAllowInsecureProtocol = true
+        }
         maven("https://jitpack.io")
     }
 }

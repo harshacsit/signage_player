@@ -33,7 +33,6 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
@@ -113,8 +112,8 @@ class MainActivity : AppCompatActivity() {
     private var currentIndex = 0
     private val handler = Handler(Looper.getMainLooper())
 
-    // Corrected interval: at ~40 screens, a 30s heartbeat blows past the
-    // Firestore Spark free-tier write limit. 5 minutes keeps us well under it.
+    // At ~40 screens, a 30s heartbeat blows past the Firestore Spark free-tier
+    // write limit. 5 minutes keeps us well under it.
     private val heartbeatIntervalMs = 300_000L
     private var advanceRunnable: Runnable? = null
 
@@ -207,15 +206,19 @@ class MainActivity : AppCompatActivity() {
                         if (state == Player.STATE_ENDED) advance()
                     }
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        Log.e("SignagePlayer", "ExoPlayer error: \${error.errorCodeName} (\${error.errorCode}) - \${error.message}", error)
+                        // FIXED: these were written as \${...} (escaped literal
+                        // dollar sign), which meant Kotlin never interpolated them —
+                        // logs printed the literal text "${error.errorCodeName}"
+                        // instead of the real value.
+                        Log.e("SignagePlayer", "ExoPlayer error: ${error.errorCodeName} (${error.errorCode}) - ${error.message}", error)
                         val cause = error.cause
                         if (cause != null) {
-                            Log.e("SignagePlayer", "Caused by: \${cause.message}", cause)
+                            Log.e("SignagePlayer", "Caused by: ${cause.message}", cause)
                         }
 
                         Toast.makeText(
                             this@MainActivity,
-                            "Playback error: \${error.errorCodeName}",
+                            "Playback error: ${error.errorCodeName}",
                             Toast.LENGTH_LONG
                         ).show()
                         handler.postDelayed({ advance() }, 3000)
@@ -458,7 +461,9 @@ class MainActivity : AppCompatActivity() {
                     val items = snapshot.get("items") as? List<Map<String, Any>>
                     if (items != null) {
                         playlistItems = items
-                        Log.d("SignageDebug", "Loaded \${playlistItems.size} items for playlist \$playlistId")
+                        // FIXED: was \${playlistItems.size} / \$playlistId (escaped,
+                        // never interpolated).
+                        Log.d("SignageDebug", "Loaded ${playlistItems.size} items for playlist $playlistId")
                         currentIndex = 0
                         playCurrentItem()
                         prefetchPlaylistItems(items)
@@ -470,7 +475,7 @@ class MainActivity : AppCompatActivity() {
     private fun playCurrentItem() {
         Log.d(
             "SignageDebug",
-            "playCurrentItem called, items=\${playlistItems.size}, index=\$currentIndex"
+            "playCurrentItem called, items=${playlistItems.size}, index=$currentIndex"
         )
         logPreviousItemPlayback()
 
@@ -485,7 +490,6 @@ class MainActivity : AppCompatActivity() {
         val type = item["type"] as? String ?: "video"
         val duration = (item["durationSeconds"] as? Long ?: 8L) * 1000L
         val resizeMode = item["resizeMode"] as? String ?: "fit"
-        val itemRotation = ((item["rotation"] as? Long) ?: 0L).toInt()
         advanceRunnable?.let { handler.removeCallbacks(it) }
 
         if (type == "video") {
@@ -532,7 +536,8 @@ class MainActivity : AppCompatActivity() {
 
             try {
                 val videoId = extractYoutubeVideoId(url)
-                Log.d("SignageDebug", "web item url=\$url extracted videoId=\$videoId")
+                // FIXED: was \$url / \$videoId — logged literal template text.
+                Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
                 if (videoId != null) {
                     val isLive = url.contains("youtube.com/live/")
                     webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
@@ -540,7 +545,7 @@ class MainActivity : AppCompatActivity() {
                     webView.loadUrl(url)
                 }
             } catch (e: Exception) {
-                Log.e("SignageDebug", "WebView load failed for \$url", e)
+                Log.e("SignageDebug", "WebView load failed for $url", e)
             }
         } else {
             videoView.visibility = View.GONE
@@ -576,29 +581,24 @@ class MainActivity : AppCompatActivity() {
                         null
                     )
                     cacheWriter.cache()
-                    Log.d("SignageDebug", "Pre-cached: \$url")
+                    // FIXED: was \$url — logged literal "${url}" instead of the URL.
+                    Log.d("SignageDebug", "Pre-cached: $url")
                 } catch (e: Exception) {
-                    Log.e("SignageDebug", "Pre-cache failed for \$url", e)
+                    Log.e("SignageDebug", "Pre-cache failed for $url", e)
                 }
             }
         }.start()
     }
 
-    private fun toDisplayUrl(rawUrl: String): String {
-        val videoId = extractYoutubeVideoId(rawUrl)
-        return if (videoId != null) {
-            "https://www.youtube.com/embed/\$videoId?autoplay=1&mute=1&controls=0&loop=1&playlist=\$videoId&rel=0&playsinline=1"
-        } else {
-            rawUrl
-        }
-    }
-
+    // FIXED: was \$videoId in the src attribute — the iframe would have literally
+    // requested https://www.youtube.com/embed/${videoId}?... (404, no interpolation),
+    // meaning every YouTube "web" playlist item would have failed to play.
     private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
-        val loopParams = if (isLive) "" else "&loop=1&playlist=\$videoId"
+        val loopParams = if (isLive) "" else "&loop=1&playlist=$videoId"
         return """
         <html><body style="margin:0;padding:0;background:#000;">
         <iframe width="100%" height="100%" style="position:fixed;top:0;left:0;border:0;"
-          src="https://www.youtube.com/embed/\$videoId?autoplay=1&mute=1&controls=0\$loopParams&rel=0&playsinline=1"
+          src="https://www.youtube.com/embed/$videoId?autoplay=1&mute=1&controls=0$loopParams&rel=0&playsinline=1"
           allow="autoplay; encrypted-media" allowfullscreen></iframe>
         </body></html>
     """.trimIndent()
@@ -628,7 +628,11 @@ class MainActivity : AppCompatActivity() {
         val playedSeconds = playedMs / 1000.0
 
         val dateKey = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
-        val dayDocId = "\${screenId}_\$dateKey"
+        // FIXED: was "\${screenId}_\$dateKey" — literal text, so every screen would
+        // have written analytics to the SAME doc id "${screenId}_${dateKey}" instead
+        // of a real per-screen, per-day doc. This alone would have silently merged
+        // every screen's analytics into one bucket.
+        val dayDocId = "${screenId}_$dateKey"
         val itemDocId = java.net.URLEncoder.encode(url, "UTF-8").take(300)
 
         db.collection("analytics").document(dayDocId)
@@ -646,7 +650,7 @@ class MainActivity : AppCompatActivity() {
                 com.google.firebase.firestore.SetOptions.merge()
             )
             .addOnFailureListener { e ->
-                Log.e("SignageDebug", "Analytics log failed for \$url", e)
+                Log.e("SignageDebug", "Analytics log failed for $url", e)
             }
     }
 

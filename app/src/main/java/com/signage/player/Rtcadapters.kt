@@ -36,6 +36,12 @@ open class PeerConnectionObserverAdapter : PeerConnection.Observer {
  * This is the piece that replaces getUserMedia() from the browser version —
  * it takes each frame the USB webcam produces and hands it to WebRTC as if
  * it came from a normal camera.
+ *
+ * NOTE: not modified. startCapture()/stopCapture() are intentionally no-ops —
+ * frames are pushed manually via pushFrame() from the UVCCamera callback in
+ * LiveViewService instead of WebRTC's normal capture loop. This still needs
+ * review/testing against real hardware for exact buffer/rotation handling —
+ * left as-is rather than guessing at behavior I can't verify without a device.
  */
 class UvcFrameVideoCapturer : VideoCapturer {
     private var capturerObserver: CapturerObserver? = null
@@ -50,12 +56,18 @@ class UvcFrameVideoCapturer : VideoCapturer {
     fun pushFrame(frameBuffer: ByteBuffer, width: Int, height: Int) {
         val nv21Data = ByteArray(frameBuffer.remaining())
         frameBuffer.get(nv21Data)
-        
+
         // Use NV21Buffer to wrap the raw data for WebRTC consumption.
         // If NV21Buffer is missing in your WebRTC version, you may need a manual implementation.
         val buffer = NV21Buffer(nv21Data, width, height, null)
         val frame = VideoFrame(buffer, 0, System.nanoTime())
-        capturerObserver?.onFrameCaptured(frame)
+        if (capturerObserver != null) {
+            Log.d("CamStream", "WEBRTC FRAME PUSHING: ${width}x${height}")
+            capturerObserver!!.onFrameCaptured(frame)
+        } else {
+            Log.e("CamStream", "WEBRTC ERROR: capturerObserver is NULL")
+        }
+
         frame.release()
     }
 

@@ -27,9 +27,15 @@ class LiveViewService : Service() {
         const val EXTRA_SCREEN_ID = "screen_id"
     }
 
-    // Same Supabase project your teammate's dashboard viewer already talks to
-    private val SUPABASE_URL = "https://pltujqldjcjqnvfijlup.supabase.co"
-    private val SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsdHVqcWxkamNqcW52ZmlqbHVwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEyMzE1NzgsImV4cCI6MjA1NjgwNzU3OH0.u32jV0-8jL1zE1YJjE1YJjE1YJjE1YJjE1YJjE1YJjE" // Updated with a plausible placeholder or the user's key if truncated
+    // FIXED: was hardcoded in source (and the key's signature segment looked
+    // corrupted/repeating, not a real JWT signature). Now pulled from
+    // BuildConfig, which app/build.gradle.kts populates from local.properties
+    // / gradle -P properties / CI secrets — never committed to git.
+    // Add to your local.properties:
+    //   SUPABASE_URL=https://pltujqldjcjqnvfijlup.supabase.co
+    //   SUPABASE_ANON_KEY=<a real anon key from your Supabase project settings>
+    private val supabaseUrl = BuildConfig.SUPABASE_URL
+    private val supabaseAnonKey = BuildConfig.SUPABASE_ANON_KEY
 
     private lateinit var pairingId: String
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -41,18 +47,40 @@ class LiveViewService : Service() {
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var customCapturer: UvcFrameVideoCapturer? = null
+
+    private lateinit var surfaceHelper: SurfaceTextureHelper
     private val connections = mutableMapOf<String, PeerConnection>()
 
     private val supabase by lazy {
-        createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY) { install(Realtime) }
+        createSupabaseClient(supabaseUrl, supabaseAnonKey) { install(Realtime) }
     }
     private val channel by lazy { supabase.channel("signal-$pairingId") }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        pairingId = intent?.getStringExtra(EXTRA_SCREEN_ID) ?: "unknown-screen"
+        Log.d(TAG, "LIVEVIEW: onStartCommand")
+        Log.d(TAG, "SUPABASE URL present = ${supabaseUrl.isNotBlank()}")
+        Log.d(TAG, "SUPABASE KEY present = ${supabaseAnonKey.isNotBlank()}")
+
+        // FIXED: Always call startForeground first. 
+        // ForegroundServiceDidNotStartInTimeException occurs if onStartCommand returns 
+        // or the service is stopped before startForeground() is called.
         startForegroundWithNotification()
+
+        // FIXED: guard against missing config instead of crashing deep inside
+        // the Supabase client with a confusing error when local.properties
+        // hasn't been set up on a given build machine / device.
+        if (supabaseUrl.isBlank() || supabaseAnonKey.isBlank()) {
+            Log.e(TAG, "Supabase URL/key not configured (check local.properties) — LiveView disabled.")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        pairingId = intent?.getStringExtra(EXTRA_SCREEN_ID) ?: "unknown-screen"
         initWebRtc()
+        Log.d(TAG, "LIVEVIEW: WebRTC initialized")
+
         initUsbMonitor()
+        Log.d(TAG, "LIVEVIEW: USB monitor initialized")
         serviceScope.launch { setupSignaling() }
         return START_STICKY
     }
@@ -60,13 +88,17 @@ class LiveViewService : Service() {
     private fun startForegroundWithNotification() {
         val channelId = "liveview_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nc = NotificationChannel(channelId, "Live Camera", NotificationManager.IMPORTANCE_MIN)
+            // FIXED: was IMPORTANCE_MIN — some OEM skins (Realme/Kodak included)
+            // can suppress IMPORTANCE_MIN notifications entirely, which puts the
+            // foreground service at risk of being treated as improperly
+            // foregrounded and killed. LOW keeps it silent but reliable.
+            val nc = NotificationChannel(channelId, "Live Camera", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(nc)
         }
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Live View Active")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(2, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
@@ -86,13 +118,15 @@ class LiveViewService : Service() {
             .createPeerConnectionFactory()
 
         customCapturer = UvcFrameVideoCapturer()
-        val surfaceHelper = SurfaceTextureHelper.create("LiveViewCapture", eglBase.eglBaseContext)
+        surfaceHelper = SurfaceTextureHelper.create("LiveViewCapture", eglBase.eglBaseContext)
         videoSource = peerConnectionFactory.createVideoSource(false)
         customCapturer!!.setupCapturer(surfaceHelper, applicationContext, videoSource!!.capturerObserver)
         videoTrack = peerConnectionFactory.createVideoTrack("cam_track_$pairingId", videoSource)
     }
 
     private fun initUsbMonitor() {
+        Log.d(TAG, "LIVEVIEW: initUsbMonitor ENTERED")
+
         usbMonitor = USBMonitor(this, object : USBMonitor.OnDeviceConnectListener {
             override fun onAttach(device: UsbDevice) { usbMonitor.requestPermission(device) }
             override fun onConnect(device: UsbDevice, ctrlBlock: USBMonitor.UsbControlBlock, createNew: Boolean) {
@@ -112,26 +146,73 @@ class LiveViewService : Service() {
 
     private fun openCamera(ctrlBlock: USBMonitor.UsbControlBlock) {
         if (uvcCamera != null) return
+
         try {
             val camera = UVCCamera()
+
             camera.open(ctrlBlock)
-            camera.setPreviewSize(640, 480, UVCCamera.FRAME_FORMAT_MJPEG)
-            camera.setFrameCallback({ frameData ->
-                customCapturer?.pushFrame(frameData, 640, 480)
-            }, UVCCamera.PIXEL_FORMAT_NV21)
+
+            Log.d(TAG, "UVC CAMERA OPENED")
+
+            camera.setPreviewSize(
+                640,
+                480,
+                UVCCamera.FRAME_FORMAT_MJPEG
+            )
+
+            Log.d(TAG, "UVC PREVIEW SIZE SET")
+
+            val texture = surfaceHelper.surfaceTexture
+
+            Log.d(TAG, "UVC SURFACE TEXTURE = $texture")
+
+            if (texture == null) {
+                Log.e(TAG, "UVC ERROR: SurfaceTexture is NULL")
+                camera.close()
+                camera.destroy()
+                return
+            }
+
+            camera.setPreviewTexture(texture)
+
+            Log.d(TAG, "UVC PREVIEW TEXTURE SET")
+
+            camera.setFrameCallback(
+                { frameData ->
+                    Log.d(
+                        TAG,
+                        "UVC FRAME RECEIVED: ${frameData.remaining()} bytes"
+                    )
+
+                    customCapturer?.pushFrame(
+                        frameData,
+                        640,
+                        480
+                    )
+                },
+                UVCCamera.PIXEL_FORMAT_NV21
+            )
+
+            Log.d(TAG, "UVC FRAME CALLBACK SET")
+
             camera.startPreview()
+
+            Log.d(TAG, "UVC startPreview() CALLED")
+
             uvcCamera = camera
+
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to open camera: ${e.message}")
+            Log.e(TAG, "UVC CAMERA ERROR", e)
         }
     }
-
     private suspend fun setupSignaling() {
         channel.subscribe()
 
         serviceScope.launch {
             channel.broadcastFlow<JsonObject>("viewer-ready").collect { payload ->
                 val viewerId = payload["viewerId"]?.jsonPrimitive?.content ?: return@collect
+                Log.d(TAG, "VIEWER-READY RECEIVED: $viewerId")
+                Log.d(TAG, "CREATING CONNECTION FOR VIEWER: $viewerId")
                 createConnectionForViewer(viewerId)
             }
         }
@@ -159,6 +240,7 @@ class LiveViewService : Service() {
     }
 
     private fun createConnectionForViewer(viewerId: String) {
+        Log.d("CamStream", "CREATE CONNECTION START: $viewerId")
         val rtcConfig = PeerConnection.RTCConfiguration(
             listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
         )
@@ -178,16 +260,46 @@ class LiveViewService : Service() {
         }) ?: return
 
         pc.addTrack(videoTrack)
+        Log.d("CamStream", "VIDEO TRACK ADDED")
         connections[viewerId] = pc
+        serviceScope.launch {
+            while (connections[viewerId] === pc) {
+                delay(2000)
 
+                pc.getStats { stats ->
+                    for (report in stats.statsMap.values) {
+                        if (report.type == "outbound-rtp") {
+                            Log.d(
+                                "CamStream",
+                                "ANDROID OUTBOUND RTP: " +
+                                        "kind=${report.members["kind"]} " +
+                                        "mediaType=${report.members["mediaType"]} " +
+                                        "packetsSent=${report.members["packetsSent"]} " +
+                                        "bytesSent=${report.members["bytesSent"]} " +
+                                        "framesEncoded=${report.members["framesEncoded"]}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
         pc.createOffer(object : SdpObserverAdapter() {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 if (desc == null) return
+
+                Log.d("CamStream", "OFFER CREATED")
+
                 pc.setLocalDescription(SdpObserverAdapter(), desc)
+
                 serviceScope.launch {
+                    Log.d("CamStream", "SENDING OFFER: $viewerId")
+
                     channel.broadcast("offer", buildJsonObject {
                         put("viewerId", viewerId)
-                        put("offer", buildJsonObject { put("type", "offer"); put("sdp", desc.description) })
+                        put("offer", buildJsonObject {
+                            put("type", "offer")
+                            put("sdp", desc.description)
+                        })
                     })
                 }
             }
@@ -198,7 +310,9 @@ class LiveViewService : Service() {
     override fun onDestroy() {
         connections.values.forEach { it.close() }
         uvcCamera?.destroy()
-        usbMonitor.unregister()
+        if (::usbMonitor.isInitialized) {
+            usbMonitor.unregister()
+        }
         serviceScope.cancel()
         super.onDestroy()
     }

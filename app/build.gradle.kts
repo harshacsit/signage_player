@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.androidApplication)
@@ -6,7 +7,17 @@ plugins {
     alias(libs.plugins.googleServices)
     alias(libs.plugins.kotlinSerialization)
 }
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
 
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use {
+        localProperties.load(it)
+    }
+}
+
+val supabaseUrl = localProperties.getProperty("SUPABASE_URL", "")
+val supabaseAnonKey = localProperties.getProperty("SUPABASE_ANON_KEY", "")
 android {
     namespace = "com.signage.player"
     compileSdk = 35
@@ -19,6 +30,28 @@ android {
         versionName = "1.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // ===== ADDED: Supabase creds pulled from local.properties / -P gradle
+        // properties / CI secrets instead of being hardcoded in LiveViewService.kt.
+        // Add these two lines to your local (gitignored) local.properties:
+        //   SUPABASE_URL=https://pltujqldjcjqnvfijlup.supabase.co
+        //   SUPABASE_ANON_KEY=<your real anon key>
+        buildConfigField(
+            "String",
+            "SUPABASE_URL",
+            "\"$supabaseUrl\""
+        )
+
+        buildConfigField(
+            "String",
+            "SUPABASE_ANON_KEY",
+            "\"$supabaseAnonKey\""
+        )
+    }
+
+    // ===== ADDED: required so buildConfigField() above actually generates BuildConfig
+    buildFeatures {
+        buildConfig = true
     }
 
     signingConfigs {
@@ -111,14 +144,17 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.3.1")
 
-    // WebRTC
-    implementation("org.webrtc:google-webrtc:1.0.32006")
+    // WebRTC - Updated to a version available on MavenCentral
+    implementation("io.github.webrtc-sdk:android:125.6422.06.1")
 
     // Supabase Realtime (signaling channel)
     implementation("io.github.jan-tennert.supabase:realtime-kt:2.6.0")
     implementation("io.ktor:ktor-client-okhttp:2.3.12")
     implementation(libs.kotlinx.serialization.json)
-
-    // UVC USB webcam support
-    implementation("com.github.saki4510t:UVCCamera:master-SNAPSHOT")
+    implementation("com.github.raphaelm.UVCCamera:libuvccamera:53d043fea2") {
+        exclude(group = "com.serenegiant", module = "common")
+    }
+    implementation("com.serenegiant:common:1.5.20") {
+        exclude(module = "support-v4") // ancient support-lib artifact, doesn't resolve anymore
+    }
 }
