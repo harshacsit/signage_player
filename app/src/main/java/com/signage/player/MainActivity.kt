@@ -206,10 +206,6 @@ class MainActivity : AppCompatActivity() {
                         if (state == Player.STATE_ENDED) advance()
                     }
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        // FIXED: these were written as \${...} (escaped literal
-                        // dollar sign), which meant Kotlin never interpolated them —
-                        // logs printed the literal text "${error.errorCodeName}"
-                        // instead of the real value.
                         Log.e("SignagePlayer", "ExoPlayer error: ${error.errorCodeName} (${error.errorCode}) - ${error.message}", error)
                         val cause = error.cause
                         if (cause != null) {
@@ -461,8 +457,6 @@ class MainActivity : AppCompatActivity() {
                     val items = snapshot.get("items") as? List<Map<String, Any>>
                     if (items != null) {
                         playlistItems = items
-                        // FIXED: was \${playlistItems.size} / \$playlistId (escaped,
-                        // never interpolated).
                         Log.d("SignageDebug", "Loaded ${playlistItems.size} items for playlist $playlistId")
                         currentIndex = 0
                         playCurrentItem()
@@ -490,6 +484,12 @@ class MainActivity : AppCompatActivity() {
         val type = item["type"] as? String ?: "video"
         val duration = (item["durationSeconds"] as? Long ?: 8L) * 1000L
         val resizeMode = item["resizeMode"] as? String ?: "fit"
+        // FIXED: was only read inside the "video" branch. This is the item's
+        // Live checkbox from the dashboard playlist editor and must gate the
+        // advance timer for "web" items too (see below) — that's what YouTube
+        // items use, and without this check they were always cut off after
+        // durationSeconds (default 8s) regardless of the Live flag.
+        val isLive = item["isLive"] as? Boolean ?: false
         advanceRunnable?.let { handler.removeCallbacks(it) }
 
         if (type == "video") {
@@ -502,7 +502,6 @@ class MainActivity : AppCompatActivity() {
                 "stretch" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
                 else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
             }
-            val isLive = item["isLive"] as? Boolean ?: false
             val isHls = url.contains(".m3u8") || isLive
 
             exoPlayer?.let { player ->
@@ -530,17 +529,29 @@ class MainActivity : AppCompatActivity() {
             exoPlayer?.stop()
             webView.visibility = View.VISIBLE
 
-            val runnable = Runnable { advance() }
-            advanceRunnable = runnable
-            handler.postDelayed(runnable, duration)
+            // FIXED: this block used to schedule advance() unconditionally,
+            // ignoring isLive entirely. YouTube playlist items use type=="web",
+            // so any YouTube video the operator didn't manually set a long
+            // durationSeconds for got cut off after the 8s default and skipped
+            // to the next item — this was the "YouTube doesn't work" bug.
+            // Only auto-advance non-live web items now, exactly like video items.
+            if (!isLive) {
+                val runnable = Runnable { advance() }
+                advanceRunnable = runnable
+                handler.postDelayed(runnable, duration)
+            }
 
             try {
                 val videoId = extractYoutubeVideoId(url)
-                // FIXED: was \$url / \$videoId — logged literal template text.
-                Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId")
+                Log.d("SignageDebug", "web item url=$url extracted videoId=$videoId isLive=$isLive")
                 if (videoId != null) {
-                    val isLive = url.contains("youtube.com/live/")
-                    webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isLive), "text/html", "utf-8", null)
+                    // FIXED: previously only inferred "live" from the URL containing
+                    // "youtube.com/live/" — the dashboard's explicit isLive checkbox
+                    // on the item was never consulted here, so a normal youtube.com/watch
+                    // link marked Live by the operator still looped/autoplayed as if
+                    // it were a regular (non-live) embed.
+                    val isYtLive = isLive || url.contains("youtube.com/live/")
+                    webView.loadDataWithBaseURL("https://www.youtube.com", buildYoutubeEmbedHtml(videoId, isYtLive), "text/html", "utf-8", null)
                 } else {
                     webView.loadUrl(url)
                 }
@@ -581,7 +592,6 @@ class MainActivity : AppCompatActivity() {
                         null
                     )
                     cacheWriter.cache()
-                    // FIXED: was \$url — logged literal "${url}" instead of the URL.
                     Log.d("SignageDebug", "Pre-cached: $url")
                 } catch (e: Exception) {
                     Log.e("SignageDebug", "Pre-cache failed for $url", e)
@@ -590,9 +600,6 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    // FIXED: was \$videoId in the src attribute — the iframe would have literally
-    // requested https://www.youtube.com/embed/${videoId}?... (404, no interpolation),
-    // meaning every YouTube "web" playlist item would have failed to play.
     private fun buildYoutubeEmbedHtml(videoId: String, isLive: Boolean): String {
         val loopParams = if (isLive) "" else "&loop=1&playlist=$videoId"
         return """
@@ -628,10 +635,6 @@ class MainActivity : AppCompatActivity() {
         val playedSeconds = playedMs / 1000.0
 
         val dateKey = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
-        // FIXED: was "\${screenId}_\$dateKey" — literal text, so every screen would
-        // have written analytics to the SAME doc id "${screenId}_${dateKey}" instead
-        // of a real per-screen, per-day doc. This alone would have silently merged
-        // every screen's analytics into one bucket.
         val dayDocId = "${screenId}_$dateKey"
         val itemDocId = java.net.URLEncoder.encode(url, "UTF-8").take(300)
 

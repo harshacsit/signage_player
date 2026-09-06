@@ -18,6 +18,9 @@ import io.github.jan.supabase.realtime.broadcastFlow
 import io.github.jan.supabase.realtime.channel
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
 import org.webrtc.*
 
 class LiveViewService : Service() {
@@ -36,6 +39,13 @@ class LiveViewService : Service() {
 
     private val serviceScope =
         CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    // Cloudflare Worker endpoint that returns short-lived ICE/TURN credentials.
+    // Replace this with your deployed Worker URL.
+    private val turnCredentialsUrl =
+        "https://turn-credentials-worker.yourname.workers.dev"
+
+    private val httpClient by lazy { OkHttpClient() }
 
     private lateinit var usbMonitor: USBMonitor
     private var uvcCamera: UVCCamera? = null
@@ -89,45 +99,58 @@ class LiveViewService : Service() {
 
         startForegroundWithNotification()
 
-        if (
-            supabaseUrl.isBlank() ||
-            supabaseAnonKey.isBlank()
-        ) {
+        try {
+            if (
+                supabaseUrl.isBlank() ||
+                supabaseAnonKey.isBlank()
+            ) {
+                Log.e(
+                    TAG,
+                    "Supabase URL/key not configured"
+                )
+
+                stopSelf()
+
+                return START_NOT_STICKY
+            }
+
+            pairingId =
+                intent?.getStringExtra(EXTRA_SCREEN_ID)
+                    ?: "unknown-screen"
+
+            Log.d(
+                TAG,
+                "PAIRING ID = $pairingId"
+            )
+
+            // Core WebRTC objects are created here.
+            // ICE/TURN servers are fetched later for each viewer.
+            initWebRtcCore()
+
+            Log.d(
+                TAG,
+                "LIVEVIEW: WebRTC core initialized"
+            )
+
+            initUsbMonitor()
+
+            Log.d(
+                TAG,
+                "LIVEVIEW: USB monitor initialized"
+            )
+
+            serviceScope.launch {
+                setupSignaling()
+            }
+
+        } catch (e: Exception) {
             Log.e(
                 TAG,
-                "Supabase URL/key not configured"
+                "LiveView failed to start",
+                e
             )
 
             stopSelf()
-
-            return START_NOT_STICKY
-        }
-
-        pairingId =
-            intent?.getStringExtra(EXTRA_SCREEN_ID)
-                ?: "unknown-screen"
-
-        Log.d(
-            TAG,
-            "PAIRING ID = $pairingId"
-        )
-
-        initWebRtc()
-
-        Log.d(
-            TAG,
-            "LIVEVIEW: WebRTC initialized"
-        )
-
-        initUsbMonitor()
-
-        Log.d(
-            TAG,
-            "LIVEVIEW: USB monitor initialized"
-        )
-
-        serviceScope.launch {
-            setupSignaling()
         }
 
         return START_STICKY
@@ -193,11 +216,11 @@ class LiveViewService : Service() {
     // WEBRTC INITIALIZATION
     // ------------------------------------------------------------
 
-    private fun initWebRtc() {
+    private fun initWebRtcCore() {
 
         Log.d(
             CAM_TAG,
-            "========== WEBRTC INITIALIZATION =========="
+            "========== WEBRTC CORE INITIALIZATION =========="
         )
 
         eglBase = EglBase.create()
@@ -598,12 +621,9 @@ class LiveViewService : Service() {
                      * Therefore Android must read payload["sdp"].
                      */
 
-                    var sdpValue =
-                        payload["sdp"]
-                            ?.jsonPrimitive
-                            ?.content
+                    val sdpElement = payload["sdp"]
 
-                    if (sdpValue == null) {
+                    if (sdpElement == null) {
 
                         Log.e(
                             CAM_TAG,
@@ -623,11 +643,6 @@ class LiveViewService : Service() {
                         "ANSWER SDP RECEIVED"
                     )
 
-                    Log.d(
-                        CAM_TAG,
-                        "ANSWER SDP LENGTH = ${sdpValue.length}"
-                    )
-
                     /*
                      * Dashboard JSON.stringify() produces:
                      *
@@ -639,10 +654,19 @@ class LiveViewService : Service() {
 
                     try {
 
-                        val answerJson =
-                            Json.parseToJsonElement(
-                                sdpValue
-                            ).jsonObject
+                        val answerJson = when (sdpElement) {
+                            is JsonObject -> sdpElement
+                            is JsonPrimitive -> Json.parseToJsonElement(sdpElement.content) as? JsonObject
+                            else -> null
+                        }
+
+                        if (answerJson == null) {
+                            Log.e(
+                                CAM_TAG,
+                                "ANSWER SDP COULD NOT BE PARSED AS JSON OBJECT"
+                            )
+                            return@collect
+                        }
 
                         val actualSdp =
                             answerJson["sdp"]
@@ -714,13 +738,7 @@ class LiveViewService : Service() {
                 )
                 .collect { payload ->
 
-                    if (
-                        payload["from"]
-                            ?.jsonPrimitive
-                            ?.content != "viewer"
-                    ) {
-                        return@collect
-                    }
+
 
                     val viewerId =
                         payload["viewerId"]
@@ -732,10 +750,33 @@ class LiveViewService : Service() {
                         connections[viewerId]
                             ?: return@collect
 
-                    val cand =
-                        payload["candidate"]
-                            ?.jsonObject
-                            ?: return@collect
+                    val candidateElement = payload["candidate"]
+                    if (candidateElement == null) {
+                        Log.e(
+                            CAM_TAG,
+                            "ICE CANDIDATE NOT FOUND IN PAYLOAD"
+                        )
+                        return@collect
+                    }
+
+                    val cand = try {
+                        when (candidateElement) {
+                            is JsonObject -> candidateElement
+                            is JsonPrimitive -> Json.parseToJsonElement(candidateElement.content) as? JsonObject
+                            else -> null
+                        }
+                    } catch (e: Exception) {
+                        Log.e(CAM_TAG, "Failed to parse candidate element", e)
+                        null
+                    }
+
+                    if (cand == null) {
+                        Log.e(
+                            CAM_TAG,
+                            "ICE CANDIDATE COULD NOT BE PARSED AS JSON OBJECT"
+                        )
+                        return@collect
+                    }
 
                     val candidate =
                         cand["candidate"]
@@ -788,38 +829,576 @@ class LiveViewService : Service() {
         viewerId: String
     ) {
 
-        Log.d(
-            CAM_TAG,
-            "========================================"
-        )
+        // Fetch fresh ICE/TURN credentials before creating this viewer's
+        // PeerConnection. The network request runs off the main thread.
+        serviceScope.launch {
 
-        Log.d(
-            CAM_TAG,
-            "CREATE CONNECTION START: $viewerId"
-        )
-
-        val track =
-            videoTrack
-
-        if (track == null) {
-
-            Log.e(
+            Log.d(
                 CAM_TAG,
-                "VIDEO TRACK IS NULL - CANNOT CREATE CONNECTION"
+                "========================================"
             )
 
-            return
+            Log.d(
+                CAM_TAG,
+                "CREATE CONNECTION START: $viewerId"
+            )
+
+            val iceServers = fetchIceServers()
+
+            Log.d(
+                CAM_TAG,
+                "ICE SERVERS READY: ${iceServers.size} entries for $viewerId"
+            )
+
+            val rtcConfig =
+                PeerConnection.RTCConfiguration(iceServers).apply {
+                    iceTransportsType =
+                        PeerConnection.IceTransportsType.ALL
+
+                    bundlePolicy =
+                        PeerConnection.BundlePolicy.MAXBUNDLE
+
+                    rtcpMuxPolicy =
+                        PeerConnection.RtcpMuxPolicy.REQUIRE
+                }
+
+            val track =
+                videoTrack
+
+            if (track == null) {
+
+                Log.e(
+                    CAM_TAG,
+                    "VIDEO TRACK IS NULL - CANNOT CREATE CONNECTION"
+                )
+
+                return@launch
+            }
+
+            Log.d(
+                CAM_TAG,
+                "VIDEO TRACK BEFORE ADD: " +
+                        "enabled=${track.enabled()}, " +
+                        "id=${track.id()}"
+            )
+
+            val pc =
+                peerConnectionFactory
+                    .createPeerConnection(
+                        rtcConfig,
+                        object :
+                            PeerConnectionObserverAdapter() {
+
+                            override fun onIceCandidate(
+                                candidate: IceCandidate
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID ICE CANDIDATE CREATED"
+                                )
+
+                                serviceScope.launch {
+
+                                    channel.broadcast(
+                                        "ice-candidate",
+                                        buildJsonObject {
+
+                                            put(
+                                                "viewerId",
+                                                viewerId
+                                            )
+
+                                            put(
+                                                "from",
+                                                "broadcaster"
+                                            )
+
+                                            put(
+                                                "candidate",
+                                                buildJsonObject {
+
+                                                    put(
+                                                        "candidate",
+                                                        candidate.sdp
+                                                    )
+
+                                                    put(
+                                                        "sdpMid",
+                                                        candidate.sdpMid
+                                                    )
+
+                                                    put(
+                                                        "sdpMLineIndex",
+                                                        candidate.sdpMLineIndex
+                                                    )
+                                                }
+                                            )
+                                        }
+                                    )
+
+                                    Log.d(
+                                        CAM_TAG,
+                                        "ANDROID ICE CANDIDATE SENT: $viewerId"
+                                    )
+                                }
+                            }
+
+                            override fun onIceConnectionChange(
+                                state: PeerConnection.IceConnectionState?
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID ICE STATE: $state"
+                                )
+                            }
+
+                            override fun onConnectionChange(
+                                newState: PeerConnection.PeerConnectionState?
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID CONNECTION STATE: $newState"
+                                )
+                            }
+
+                            override fun onSignalingChange(
+                                state: PeerConnection.SignalingState?
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID SIGNALING STATE: $state"
+                                )
+                            }
+
+                            override fun onIceGatheringChange(
+                                state: PeerConnection.IceGatheringState?
+                            ) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "ANDROID ICE GATHERING: $state"
+                                )
+                            }
+                        }
+                    )
+
+            if (pc == null) {
+
+                Log.e(
+                    CAM_TAG,
+                    "PEER CONNECTION CREATION FAILED"
+                )
+
+                return@launch
+            }
+
+            Log.d(
+                CAM_TAG,
+                "PEER CONNECTION CREATED"
+            )
+
+            // --------------------------------------------------------
+            // ADD VIDEO TRACK
+            // --------------------------------------------------------
+
+            val sender =
+                pc.addTrack(track)
+
+            Log.d(
+                CAM_TAG,
+                "VIDEO TRACK ADDED: " +
+                        "enabled=${track.enabled()}, " +
+                        "id=${track.id()}"
+            )
+
+            Log.d(
+                CAM_TAG,
+                "RTP SENDER CREATED: $sender"
+            )
+
+            connections[viewerId] = pc
+
+            // --------------------------------------------------------
+            // RTP STATS
+            // --------------------------------------------------------
+
+            serviceScope.launch {
+
+                while (
+                    connections[viewerId] === pc
+                ) {
+
+                    delay(2000)
+
+                    try {
+
+                        pc.getStats { stats ->
+
+                            var foundOutbound =
+                                false
+
+                            for (
+                            report
+                            in stats.statsMap.values
+                            ) {
+
+                                if (
+                                    report.type ==
+                                    "outbound-rtp"
+                                ) {
+
+                                    foundOutbound = true
+
+                                    Log.d(
+                                        CAM_TAG,
+                                        "ANDROID OUTBOUND RTP: " +
+                                                "kind=${report.members["kind"]} " +
+                                                "mediaType=${report.members["mediaType"]} " +
+                                                "packetsSent=${report.members["packetsSent"]} " +
+                                                "bytesSent=${report.members["bytesSent"]} " +
+                                                "framesEncoded=${report.members["framesEncoded"]} " +
+                                                "framesSent=${report.members["framesSent"]}"
+                                    )
+                                }
+
+                                if (
+                                    report.type ==
+                                    "media-source"
+                                ) {
+
+                                    Log.d(
+                                        CAM_TAG,
+                                        "ANDROID MEDIA SOURCE: " +
+                                                "kind=${report.members["kind"]} " +
+                                                "width=${report.members["width"]} " +
+                                                "height=${report.members["height"]} " +
+                                                "frames=${report.members["frames"]}"
+                                    )
+                                }
+                            }
+
+                            if (!foundOutbound) {
+
+                                Log.d(
+                                    CAM_TAG,
+                                    "NO OUTBOUND RTP REPORT FOUND"
+                                )
+                            }
+                        }
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "ANDROID STATS ERROR",
+                            e
+                        )
+                    }
+                }
+            }
+
+            // --------------------------------------------------------
+            // CREATE OFFER
+            // --------------------------------------------------------
+
+            pc.createOffer(
+                object : SdpObserverAdapter() {
+
+                    override fun onCreateSuccess(
+                        desc: SessionDescription?
+                    ) {
+
+                        if (desc == null) {
+
+                            Log.e(
+                                CAM_TAG,
+                                "OFFER CREATED BUT DESC IS NULL"
+                            )
+
+                            return
+                        }
+
+                        Log.d(
+                            CAM_TAG,
+                            "OFFER CREATED"
+                        )
+
+                        Log.d(
+                            CAM_TAG,
+                            "OFFER SDP LENGTH = ${desc.description.length}"
+                        )
+
+                        pc.setLocalDescription(
+                            object : SdpObserverAdapter() {
+
+                                override fun onSetSuccess() {
+
+                                    Log.d(
+                                        CAM_TAG,
+                                        "LOCAL DESCRIPTION SET SUCCESS"
+                                    )
+                                }
+
+                                override fun onSetFailure(
+                                    error: String?
+                                ) {
+
+                                    Log.e(
+                                        CAM_TAG,
+                                        "LOCAL DESCRIPTION SET FAILED: $error"
+                                    )
+                                }
+                            },
+                            desc
+                        )
+
+                        serviceScope.launch {
+
+                            Log.d(
+                                CAM_TAG,
+                                "SENDING OFFER: $viewerId"
+                            )
+
+                            channel.broadcast(
+                                "offer",
+                                buildJsonObject {
+
+                                    put(
+                                        "viewerId",
+                                        viewerId
+                                    )
+
+                                    put(
+                                        "offer",
+                                        buildJsonObject {
+
+                                            put(
+                                                "type",
+                                                "offer"
+                                            )
+
+                                            put(
+                                                "sdp",
+                                                desc.description
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+
+                            Log.d(
+                                CAM_TAG,
+                                "OFFER SENT: $viewerId"
+                            )
+                        }
+                    }
+
+                    override fun onCreateFailure(
+                        error: String?
+                    ) {
+
+                        Log.e(
+                            CAM_TAG,
+                            "OFFER CREATE FAILED: $error"
+                        )
+                    }
+                },
+                MediaConstraints()
+            )
         }
+    }
 
-        Log.d(
-            CAM_TAG,
-            "VIDEO TRACK BEFORE ADD: " +
-                    "enabled=${track.enabled()}, " +
-                    "id=${track.id()}"
-        )
+    // ------------------------------------------------------------
+    // TURN / ICE SERVER CREDENTIALS
+    // ------------------------------------------------------------
 
-        val rtcConfig =
-            PeerConnection.RTCConfiguration(
+    /**
+     * Fetch short-lived ICE/TURN credentials from the Cloudflare Worker.
+     *
+     * Expected Worker response:
+     *
+     * {
+     *   "iceServers": [
+     *     {
+     *       "urls": [
+     *         "turn:...",
+     *         "turns:..."
+     *       ],
+     *       "username": "...",
+     *       "credential": "..."
+     *     }
+     *   ]
+     * }
+     *
+     * The TURN username/password are never hardcoded in this Android app.
+     * If the Worker cannot be reached or returns invalid data, we fall back
+     * to Google STUN so direct WebRTC connections can still be attempted.
+     */
+    private suspend fun fetchIceServers():
+            List<PeerConnection.IceServer> {
+
+        return withContext(Dispatchers.IO) {
+
+            try {
+
+                Log.d(
+                    CAM_TAG,
+                    "FETCHING ICE SERVERS FROM WORKER"
+                )
+
+                val request =
+                    Request.Builder()
+                        .url(turnCredentialsUrl)
+                        .get()
+                        .build()
+
+                httpClient
+                    .newCall(request)
+                    .execute()
+                    .use { response ->
+
+                        if (!response.isSuccessful) {
+
+                            throw IllegalStateException(
+                                "TURN credential request failed: " +
+                                        "HTTP ${response.code}"
+                            )
+                        }
+
+                        val body =
+                            response.body?.string()
+                        Log.d(CAM_TAG, "TURN WORKER RAW RESPONSE = $body")
+
+                        if (body.isNullOrBlank()) {
+
+                            throw IllegalStateException(
+                                "TURN credential response body is empty"
+                            )
+                        }
+
+                        val json =
+                            JSONObject(body)
+
+                        val serversArray =
+                            json.optJSONArray("iceServers")
+                                ?: throw IllegalStateException(
+                                    "Response does not contain iceServers"
+                                )
+
+                        val result =
+                            mutableListOf<PeerConnection.IceServer>()
+
+                        for (i in 0 until serversArray.length()) {
+
+                            val entry =
+                                serversArray.optJSONObject(i)
+                                    ?: continue
+
+                            val username =
+                                entry.optString(
+                                    "username",
+                                    null
+                                )
+
+                            val credential =
+                                entry.optString(
+                                    "credential",
+                                    null
+                                )
+
+                            val urls =
+                                entry.optJSONArray("urls")
+
+                            if (urls == null) {
+
+                                // Accept a single string URL as well.
+                                val singleUrl =
+                                    entry.optString(
+                                        "urls",
+                                        ""
+                                    )
+
+                                if (singleUrl.isNotBlank()) {
+
+                                    val builder =
+                                        PeerConnection.IceServer
+                                            .builder(singleUrl)
+
+                                    if (!username.isNullOrBlank()) {
+                                        builder.setUsername(username)
+                                    }
+
+                                    if (!credential.isNullOrBlank()) {
+                                        builder.setPassword(credential)
+                                    }
+
+                                    result.add(
+                                        builder.createIceServer()
+                                    )
+                                }
+
+                                continue
+                            }
+
+                            // PeerConnection.IceServer.builder() accepts one
+                            // URI, so create one IceServer for every URL.
+                            for (j in 0 until urls.length()) {
+
+                                val url =
+                                    urls.optString(
+                                        j,
+                                        ""
+                                    )
+
+                                if (url.isBlank()) {
+                                    continue
+                                }
+
+                                val builder =
+                                    PeerConnection.IceServer
+                                        .builder(url)
+
+                                if (!username.isNullOrBlank()) {
+                                    builder.setUsername(username)
+                                }
+
+                                if (!credential.isNullOrBlank()) {
+                                    builder.setPassword(credential)
+                                }
+
+                                result.add(
+                                    builder.createIceServer()
+                                )
+                            }
+                        }
+
+                        if (result.isEmpty()) {
+
+                            throw IllegalStateException(
+                                "Worker returned no usable ICE servers"
+                            )
+                        }
+
+                        Log.d(
+                            CAM_TAG,
+                            "ICE SERVERS FETCHED SUCCESSFULLY: ${result.size}"
+                        )
+
+                        result
+                    }
+
+            } catch (e: Exception) {
+
+                Log.e(
+                    CAM_TAG,
+                    "FAILED TO FETCH TURN CREDENTIALS - FALLING BACK TO STUN ONLY",
+                    e
+                )
+
                 listOf(
                     PeerConnection.IceServer
                         .builder(
@@ -827,335 +1406,8 @@ class LiveViewService : Service() {
                         )
                         .createIceServer()
                 )
-            )
-
-        val pc =
-            peerConnectionFactory
-                .createPeerConnection(
-                    rtcConfig,
-                    object :
-                        PeerConnectionObserverAdapter() {
-
-                        override fun onIceCandidate(
-                            candidate: IceCandidate
-                        ) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "ANDROID ICE CANDIDATE CREATED"
-                            )
-
-                            serviceScope.launch {
-
-                                channel.broadcast(
-                                    "ice-candidate",
-                                    buildJsonObject {
-
-                                        put(
-                                            "viewerId",
-                                            viewerId
-                                        )
-
-                                        put(
-                                            "from",
-                                            "broadcaster"
-                                        )
-
-                                        put(
-                                            "candidate",
-                                            buildJsonObject {
-
-                                                put(
-                                                    "candidate",
-                                                    candidate.sdp
-                                                )
-
-                                                put(
-                                                    "sdpMid",
-                                                    candidate.sdpMid
-                                                )
-
-                                                put(
-                                                    "sdpMLineIndex",
-                                                    candidate.sdpMLineIndex
-                                                )
-                                            }
-                                        )
-                                    }
-                                )
-
-                                Log.d(
-                                    CAM_TAG,
-                                    "ANDROID ICE CANDIDATE SENT: $viewerId"
-                                )
-                            }
-                        }
-
-                        override fun onIceConnectionChange(
-                            state: PeerConnection.IceConnectionState?
-                        ) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "ANDROID ICE STATE: $state"
-                            )
-                        }
-
-                        override fun onConnectionChange(
-                            newState: PeerConnection.PeerConnectionState?
-                        ) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "ANDROID CONNECTION STATE: $newState"
-                            )
-                        }
-
-                        override fun onSignalingChange(
-                            state: PeerConnection.SignalingState?
-                        ) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "ANDROID SIGNALING STATE: $state"
-                            )
-                        }
-
-                        override fun onIceGatheringChange(
-                            state: PeerConnection.IceGatheringState?
-                        ) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "ANDROID ICE GATHERING: $state"
-                            )
-                        }
-                    }
-                )
-
-        if (pc == null) {
-
-            Log.e(
-                CAM_TAG,
-                "PEER CONNECTION CREATION FAILED"
-            )
-
-            return
-        }
-
-        Log.d(
-            CAM_TAG,
-            "PEER CONNECTION CREATED"
-        )
-
-        // --------------------------------------------------------
-        // ADD VIDEO TRACK
-        // --------------------------------------------------------
-
-        val sender =
-            pc.addTrack(track)
-
-        Log.d(
-            CAM_TAG,
-            "VIDEO TRACK ADDED: " +
-                    "enabled=${track.enabled()}, " +
-                    "id=${track.id()}"
-        )
-
-        Log.d(
-            CAM_TAG,
-            "RTP SENDER CREATED: $sender"
-        )
-
-        connections[viewerId] = pc
-
-        // --------------------------------------------------------
-        // RTP STATS
-        // --------------------------------------------------------
-
-        serviceScope.launch {
-
-            while (
-                connections[viewerId] === pc
-            ) {
-
-                delay(2000)
-
-                try {
-
-                    pc.getStats { stats ->
-
-                        var foundOutbound =
-                            false
-
-                        for (
-                        report
-                        in stats.statsMap.values
-                        ) {
-
-                            if (
-                                report.type ==
-                                "outbound-rtp"
-                            ) {
-
-                                foundOutbound = true
-
-                                Log.d(
-                                    CAM_TAG,
-                                    "ANDROID OUTBOUND RTP: " +
-                                            "kind=${report.members["kind"]} " +
-                                            "mediaType=${report.members["mediaType"]} " +
-                                            "packetsSent=${report.members["packetsSent"]} " +
-                                            "bytesSent=${report.members["bytesSent"]} " +
-                                            "framesEncoded=${report.members["framesEncoded"]} " +
-                                            "framesSent=${report.members["framesSent"]}"
-                                )
-                            }
-
-                            if (
-                                report.type ==
-                                "media-source"
-                            ) {
-
-                                Log.d(
-                                    CAM_TAG,
-                                    "ANDROID MEDIA SOURCE: " +
-                                            "kind=${report.members["kind"]} " +
-                                            "width=${report.members["width"]} " +
-                                            "height=${report.members["height"]} " +
-                                            "frames=${report.members["frames"]}"
-                                )
-                            }
-                        }
-
-                        if (!foundOutbound) {
-
-                            Log.d(
-                                CAM_TAG,
-                                "NO OUTBOUND RTP REPORT FOUND"
-                            )
-                        }
-                    }
-
-                } catch (e: Exception) {
-
-                    Log.e(
-                        CAM_TAG,
-                        "ANDROID STATS ERROR",
-                        e
-                    )
-                }
             }
         }
-
-        // --------------------------------------------------------
-        // CREATE OFFER
-        // --------------------------------------------------------
-
-        pc.createOffer(
-            object : SdpObserverAdapter() {
-
-                override fun onCreateSuccess(
-                    desc: SessionDescription?
-                ) {
-
-                    if (desc == null) {
-
-                        Log.e(
-                            CAM_TAG,
-                            "OFFER CREATED BUT DESC IS NULL"
-                        )
-
-                        return
-                    }
-
-                    Log.d(
-                        CAM_TAG,
-                        "OFFER CREATED"
-                    )
-
-                    Log.d(
-                        CAM_TAG,
-                        "OFFER SDP LENGTH = ${desc.description.length}"
-                    )
-
-                    pc.setLocalDescription(
-                        object : SdpObserverAdapter() {
-
-                            override fun onSetSuccess() {
-
-                                Log.d(
-                                    CAM_TAG,
-                                    "LOCAL DESCRIPTION SET SUCCESS"
-                                )
-                            }
-
-                            override fun onSetFailure(
-                                error: String?
-                            ) {
-
-                                Log.e(
-                                    CAM_TAG,
-                                    "LOCAL DESCRIPTION SET FAILED: $error"
-                                )
-                            }
-                        },
-                        desc
-                    )
-
-                    serviceScope.launch {
-
-                        Log.d(
-                            CAM_TAG,
-                            "SENDING OFFER: $viewerId"
-                        )
-
-                        channel.broadcast(
-                            "offer",
-                            buildJsonObject {
-
-                                put(
-                                    "viewerId",
-                                    viewerId
-                                )
-
-                                put(
-                                    "offer",
-                                    buildJsonObject {
-
-                                        put(
-                                            "type",
-                                            "offer"
-                                        )
-
-                                        put(
-                                            "sdp",
-                                            desc.description
-                                        )
-                                    }
-                                )
-                            }
-                        )
-
-                        Log.d(
-                            CAM_TAG,
-                            "OFFER SENT: $viewerId"
-                        )
-                    }
-                }
-
-                override fun onCreateFailure(
-                    error: String?
-                ) {
-
-                    Log.e(
-                        CAM_TAG,
-                        "OFFER CREATE FAILED: $error"
-                    )
-                }
-            },
-            MediaConstraints()
-        )
     }
 
     // ------------------------------------------------------------
