@@ -41,9 +41,10 @@ class LiveViewService : Service() {
         CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     // Cloudflare Worker endpoint that returns short-lived ICE/TURN credentials.
-    // Replace this with your deployed Worker URL.
-    private val turnCredentialsUrl =
-        "https://turn-credentials-worker.yourname.workers.dev"
+    // Replace this with your deployed Worker URL or pull it from BuildConfig (via local.properties).
+    private val turnCredentialsUrl = BuildConfig.TURN_WORKER_URL.ifBlank {
+        "https://turn-credentials-worker.bhimavaram-signage.workers.dev"
+    }
 
     private val httpClient by lazy { OkHttpClient() }
 
@@ -1464,7 +1465,7 @@ class LiveViewService : Service() {
             try {
                 surfaceHelper.dispose()
             } catch (_: Exception) {
-            }
+}
         }
 
         try {

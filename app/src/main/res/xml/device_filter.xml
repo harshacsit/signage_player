@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB Video Class (UVC) = class 14 (0x0E). Matches by device class,
+         not vendor/product ID, so it works for any UVC webcam across
+         different screens without per-model IDs. -->
+    <usb-device class="14" />
+</resources>

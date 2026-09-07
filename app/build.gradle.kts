@@ -18,6 +18,9 @@ if (localPropertiesFile.exists()) {
 
 val supabaseUrl = localProperties.getProperty("SUPABASE_URL", "")
 val supabaseAnonKey = localProperties.getProperty("SUPABASE_ANON_KEY", "")
+
+val turnWorkerUrl = localProperties.getProperty("TURN_WORKER_URL", "")
+
 android {
     namespace = "com.signage.player"
     compileSdk = 35
@@ -46,6 +49,12 @@ android {
             "String",
             "SUPABASE_ANON_KEY",
             "\"$supabaseAnonKey\""
+        )
+
+        buildConfigField(
+            "String",
+            "TURN_WORKER_URL",
+            "\"$turnWorkerUrl\""
         )
     }
 
@@ -94,6 +103,12 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        getByName("main") {
+            (java as org.gradle.api.tasks.util.PatternFilterable).exclude("com/serenegiant/usb/USBMonitor.java")
+        }
     }
 }
 
@@ -155,6 +170,6 @@ dependencies {
         exclude(group = "com.serenegiant", module = "common")
     }
     implementation("com.serenegiant:common:1.5.20") {
-        exclude(module = "support-v4") // ancient support-lib artifact, doesn't resolve anymore
+        exclude(group = "com.android.support", module = "support-v4")
     }
 }
